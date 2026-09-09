@@ -16,7 +16,7 @@ import numpy as np
 
 
 FILTERED_RELATIONS = frozenset(("Other", "None", "none", "NA"))
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 OUTPUT_FILES = {
     "train_labeled": "train_labeled.jsonl",
     "train_unlabeled": "train_unlabeled.jsonl",
@@ -47,6 +47,9 @@ def _span(entity, tokens, position_format, name):
         start, stop = pos
     if not 0 <= start < stop <= len(tokens):
         raise ValueError("{}.pos is empty or outside token boundaries".format(name))
+    if not _clean_text(" ".join(tokens[start:stop])):
+        raise ValueError("{}.pos [{}, {}) contains only blank tokens; cannot locate entity text".format(
+            name, start, stop))
     entity_name = entity.get("name")
     if entity_name is None or entity_name == "":
         entity_name = " ".join(tokens[start:stop])
@@ -71,9 +74,15 @@ def format_relation_text(record, position_format="indices"):
     tokens = record.get("tokens", record.get("token"))
     if not isinstance(tokens, list) or not tokens:
         raise ValueError("tokens (or token) must be a nonempty list")
-    if any(not isinstance(token, str) or not _clean_text(token) for token in tokens):
-        raise ValueError("every token must be nonempty text")
+    for index, token in enumerate(tokens):
+        if not isinstance(token, str):
+            raise ValueError("tokens[{}] must be a string, got {}: {!r}".format(
+                index, type(token).__name__, token))
+    # Keep ALL original positions until entity markers have been inserted.
+    # Filtering empty/whitespace tokens here would shift h.pos and t.pos.
     tokens = [_clean_text(token) for token in tokens]
+    if not any(tokens):
+        raise ValueError("sentence contains only blank tokens")
     hs, he, hn = _span(record.get("h"), tokens, position_format, "h")
     ts, te, tn = _span(record.get("t"), tokens, position_format, "t")
     marked = []
@@ -82,7 +91,8 @@ def format_relation_text(record, position_format="indices"):
             marked.append("[HEAD]")
         if i == ts:
             marked.append("[TAIL]")
-        marked.append(token)
+        if token:
+            marked.append(token)
         if i + 1 == te:
             marked.append("[/TAIL]")
         if i + 1 == he:
@@ -95,6 +105,9 @@ def _read_source(source_path, position_format):
     rows, classes = [], []
     filtered = Counter()
     nonempty_lines = 0
+    blank_token_count = 0
+    records_with_blank_tokens = 0
+    blank_token_examples = []
     for line_number, line in enumerate(raw.decode("utf-8-sig").splitlines(), 1):
         if not line.strip():
             continue
@@ -118,6 +131,13 @@ def _read_source(source_path, position_format):
             raise ValueError("{}: {}".format(context, exc)) from exc
         if relation not in classes:
             classes.append(relation)
+        tokens = record.get("tokens", record.get("token"))
+        blank_positions = [i for i, token in enumerate(tokens) if not _clean_text(token)]
+        if blank_positions:
+            blank_token_count += len(blank_positions)
+            records_with_blank_tokens += 1
+            if len(blank_token_examples) < 20:
+                blank_token_examples.append({"line": line_number, "positions": blank_positions})
         rows.append({
             "id": "{}:{:08d}".format(source_path.stem, line_number),
             "text": text,
@@ -131,6 +151,9 @@ def _read_source(source_path, position_format):
         "retained_records": len(rows),
         "filtered_records": sum(filtered.values()),
         "filtered_relations": dict(sorted(filtered.items())),
+        "blank_token_count": blank_token_count,
+        "records_with_blank_tokens": records_with_blank_tokens,
+        "blank_token_examples": blank_token_examples,
     }
     return rows, classes, metadata
 
@@ -250,6 +273,9 @@ def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
         "seed": seed,
         "rng": "numpy.random.RandomState; shuffle each base class in fixed class order",
         "position_format": position_format,
+        "blank_token_policy": "Keep original token positions for entity spans; omit blank strings "
+                              "only when rendering the marked sentence. Retain records; reject "
+                              "non-string tokens and entirely blank entity spans.",
         "base_classes": base_classes,
         "novel_classes": novel_classes,
         "classes": classes,
@@ -264,6 +290,11 @@ def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
         "class_counts": class_counts,
         "audit": _audit(base_rows + novel_rows, splits),
     }
+    manifest["audit"].update({
+        "blank_token_count": train_info["blank_token_count"] + test_info["blank_token_count"],
+        "records_with_blank_tokens": (train_info["records_with_blank_tokens"]
+                                      + test_info["records_with_blank_tokens"]),
+    })
     # Input/validation failures above create no output. Exclusive directory
     # creation also protects against an output appearing while preparing.
     output_dir.mkdir(parents=True, exist_ok=False)

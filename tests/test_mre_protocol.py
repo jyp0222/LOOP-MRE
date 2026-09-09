@@ -88,6 +88,53 @@ class MREProtocolTests(unittest.TestCase):
         row["token"] = row.pop("tokens")
         self.assertIn("Person0", format_relation_text(row))
 
+    def test_blank_tokens_preserve_entity_indices_and_input(self):
+        row = {"tokens": ["", "Alice", " ", "visited", "New", "\t", "York", "\n"],
+               "h": {"pos": [1]}, "t": {"pos": [4, 5, 6]}}
+        original = copy.deepcopy(row)
+        self.assertEqual(format_relation_text(row),
+                         "Head: Alice. Tail: New York. Sentence: "
+                         "[HEAD] Alice [/HEAD] visited [TAIL] New York [/TAIL]")
+        self.assertEqual(row, original)
+        row["h"]["pos"] = [0, 3]
+        row["t"]["pos"] = [4, 8]
+        self.assertEqual(format_relation_text(row, "half_open"), format_relation_text(original))
+
+    def test_blank_sentence_and_blank_entity_rejected(self):
+        with self.assertRaisesRegex(ValueError, "sentence contains only blank"):
+            format_relation_text({"tokens": ["", "\t"], "h": {"pos": [0]}, "t": {"pos": [1]}})
+        with self.assertRaisesRegex(ValueError, "h.pos .* contains only blank"):
+            format_relation_text({"tokens": ["", "Paris"],
+                                  "h": {"pos": [0], "name": "Alice"}, "t": {"pos": [1]}})
+
+    def test_non_string_tokens_report_index_and_source_line(self):
+        self.fixture()
+        for bad in (None, 42, ["bad"]):
+            row = sample("base", 1)
+            row["tokens"][1] = bad
+            write_rows(self.source / "train.txt", [sample("base", i) for i in range(72)] + [row])
+            with self.subTest(bad=bad), self.assertRaisesRegex(ValueError, r"train.txt:73: tokens\[1\]"):
+                self.prepare()
+
+    def test_blank_token_audit_retains_records_and_split_counts(self):
+        _, _, train, test = self.fixture()
+        for row in (train[0], test[0]):
+            row["tokens"].insert(0, "\t")
+            row["tokens"].append("")
+            row["h"]["pos"] = [1]
+            row["t"]["pos"] = [3, 4]
+        write_rows(self.source / "train.txt", train)
+        write_rows(self.source / "test.txt", test)
+        before = (self.source / "train.txt").read_bytes()
+        manifest = self.prepare()
+        self.assertEqual(manifest["audit"]["blank_token_count"], 4)
+        self.assertEqual(manifest["audit"]["records_with_blank_tokens"], 2)
+        self.assertEqual(manifest["sources"]["train"]["blank_token_examples"],
+                         [{"line": 1, "positions": [0, 5]}])
+        self.assertEqual({key: value["count"] for key, value in manifest["splits"].items()},
+                         {"train_labeled": 2, "validation": 2, "train_unlabeled": 9, "test": 9})
+        self.assertEqual((self.source / "train.txt").read_bytes(), before)
+
     def test_exact_sample_split_counts_and_source_unchanged(self):
         bases, novels, _, _ = self.fixture()
         before = {name: (self.source / name).read_bytes() for name in ("train.txt", "test.txt")}
