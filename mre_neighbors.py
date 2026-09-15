@@ -61,6 +61,28 @@ def mine_neighbors(features, pseudo_labels, centers, topk=20, query_pool_size=50
     return indices, selected
 
 
+def cap_query_candidates(indices, pseudo_labels, selected, limit=None):
+    """Bound smoke queries after normal selection, keeping its ranking order.
+
+    Only anchors with two distinct neighbor pseudo-classes can reach the LLM
+    in NeighborPairs. Self is excluded exactly as in that dataset. No gold
+    labels are used, and uncapped formal runs keep the original selection.
+    """
+    if limit is None:
+        return list(selected)
+    if type(limit) is not int or limit < 0:
+        raise ValueError('Query cap must be a nonnegative integer or None')
+    indices, pseudo_labels = np.asarray(indices), np.asarray(pseudo_labels)
+    capped = []
+    for index in selected:
+        if len(capped) >= limit:
+            break
+        others = indices[index][indices[index] != index]
+        if len(np.unique(pseudo_labels[others])) >= 2:
+            capped.append(int(index))
+    return capped
+
+
 def adjacency_mask(indices, neighbors, targets):
     """LOOP RNCL positives plus genuinely labeled same-class examples only."""
     indices = np.asarray(indices)

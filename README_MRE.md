@@ -173,7 +173,9 @@ python run_mre.py --check-llm
 python run_mre.py --smoke
 ```
 
-默认将预训练与 LOOP 训练各设为 2 轮，并把每次近邻更新的待查询 anchor 上限降为 5；默认不生成簇名称。在默认更新频率下，短流程只更新一次近邻。实际查询可能少于 5 个甚至为 0，不能仅凭“训练结束”断言训练中一定用了 GPT，应检查 `llm_summary.json` 和 `neighbor_queries.jsonl`。HTTP 重试可能使尝试数大于 anchor 数；必要时另加 `--max-requests`。短流程指标只用于确认流程可运行。
+默认将预训练与 LOOP 训练各设为 2 轮，保留配置中的正常候选排名池（默认 500），取交集后再选出最多 5 个具有两个不同邻居伪类别的 anchor；默认不生成簇名称。查询上限记入 `config.json` 的 `max_queries_per_refresh`，正式实验为 `null`，保持未截断的原候选筛选。在默认更新频率下，短流程只更新一次近邻，已询问的 anchor 在该轮近邻图内复用答案。
+
+这修复了旧版 smoke 将两个排名都缩为前 5 名、导致交集容易为空的问题。如果正常候选池的交集本身仍为空或没有可比较候选，代码不会强行补充查询；短流程结束时会明确提示 `Smoke coverage incomplete`。应检查 `llm_summary.json` 和 `neighbor_queries.jsonl`，不能仅凭“训练结束”断言训练中一定用了 GPT。HTTP 重试可能使尝试数大于 anchor 数；必要时另加 `--max-requests`。短流程指标只用于确认流程可运行。
 
 **第六步：正式实验与无 LLM 对照。**
 

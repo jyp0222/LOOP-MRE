@@ -21,9 +21,11 @@ def experiment_config(args):
                   model=args.model, reasoning_effort=args.reasoning_effort,
                   api_base=defaults.API_BASE, max_output_tokens=defaults.MAX_OUTPUT_TOKENS,
                   request_timeout=defaults.REQUEST_TIMEOUT, max_retries=defaults.MAX_RETRIES,
-                  max_requests=args.max_requests)
+                  max_requests=args.max_requests, max_queries_per_refresh=None)
     if args.smoke:
-        config.update(pretrain_epochs=2, train_epochs=2, query_pool_size=5, name_clusters=False)
+        # Keep the normal ranking pools. Cap actual eligible anchors AFTER
+        # intersection; top-5 vs top-5 can have an empty intersection.
+        config.update(pretrain_epochs=2, train_epochs=2, max_queries_per_refresh=5, name_clusters=False)
     if args.name_clusters:
         config['name_clusters'] = True
     for name in ('pretrain_epochs', 'train_epochs', 'patience', 'labeled_batch_size',
@@ -196,6 +198,9 @@ def main(argv=None):
     trainer = MRETrainer(config, data, tokenizer, run_dir, client)
     try:
         trainer.train()
+        if args.smoke and client and client.requests_made == 0 and client.cache_hits == 0:
+            print('Smoke coverage incomplete: training finished, but no LLM neighbor query was exercised.',
+                  flush=True)
     finally:
         if client:
             (run_dir / 'llm_summary.json').write_text(json.dumps({

@@ -18,7 +18,8 @@ from transformers import get_linear_schedule_with_warmup
 
 from model import BertForModel, CLBert
 from mre_metrics import mre_accuracy
-from mre_neighbors import adjacency_mask, mine_neighbors, predict_clusters, squared_distances
+from mre_neighbors import (adjacency_mask, cap_query_candidates, mine_neighbors,
+                           predict_clusters, squared_distances)
 from utils.tools import mask_tokens
 
 
@@ -222,11 +223,14 @@ class MRETrainer:
                 pseudo = predict_clusters(features, centers)
                 indices, selected = mine_neighbors(features, pseudo, centers, cfg['topk'],
                                                     cfg['query_pool_size'])
+                ranked_count = len(selected)
+                selected = cap_query_candidates(indices, pseudo, selected, cfg.get('max_queries_per_refresh'))
                 pairs = NeighborPairs(data, indices, selected, pseudo, self.client,
                                       cfg['seed'] + epoch, self.run_dir / 'neighbor_queries.jsonl')
                 loader = DataLoader(pairs, batch_size=cfg['train_batch_size'], shuffle=True,
                                     num_workers=0, generator=torch.Generator().manual_seed(cfg['seed'] + epoch))
-                print('Neighbor refresh: {} candidate queries'.format(len(selected)), flush=True)
+                print('Neighbor refresh: {} candidate queries (ranked intersection: {}; query cap: {})'.format(
+                    len(selected), ranked_count, cfg.get('max_queries_per_refresh')), flush=True)
             self.model.train()
             total_loss = 0.0
             for batch in loader:
