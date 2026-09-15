@@ -1,4 +1,4 @@
-"""OpenAI Responses client for text-only, directed-relation LOOP queries.
+"""GPT-3.5 Turbo Chat Completions client for directed-relation LOOP queries.
 
 Uses requests rather than the OpenAI SDK so the original Python 3.8 / openai
 0.28 training environment can be retained. No network call or key prompt occurs
@@ -12,8 +12,8 @@ max_requests caps HTTP attempts per client instance, including failed attempts
 and retries; it is not a monetary limit. Restarting creates a new attempt budget.
 
 Official references checked for this implementation:
-https://developers.openai.com/api/docs/models/gpt-5.6-sol
-https://developers.openai.com/api/docs/models/gpt-6-astra
+https://developers.openai.com/api/docs/models/gpt-3.5-turbo
+https://developers.openai.com/api/docs/deprecations
 https://developers.openai.com/api/docs/guides/structured-outputs
 """
 
@@ -32,12 +32,8 @@ from urllib.parse import urlparse
 import requests
 
 
-PROMPT_VERSION = "mre-directed-relation-v1"
-_MODEL_EFFORTS = {
-    "gpt-5.6": ("none", "low", "medium", "high", "xhigh", "max"),
-    "gpt-5.6-sol": ("none", "low", "medium", "high", "xhigh", "max"),
-    "gpt-6-astra": ("low", "medium", "high", "xhigh", "max"),
-}
+PROMPT_VERSION = "mre-directed-relation-gpt35-chat-v2"
+SUPPORTED_MODELS = ("gpt-3.5-turbo", "gpt-3.5-turbo-0125", "gpt-3.5-turbo-1106")
 
 
 class LLMError(RuntimeError):
@@ -49,7 +45,7 @@ class LLMBudgetExceeded(LLMError):
 
 
 class LLMClient:
-    """Strict structured-output client, with optional persistent JSONL caching.
+    """JSON-mode client with local schema validation and JSONL caching.
 
     Key precedence: explicit api_key, explicit api_key_file, OPENAI_API_KEY,
     then an interactive hidden prompt. An explicitly configured empty/missing
@@ -59,7 +55,7 @@ class LLMClient:
 
     def __init__(
         self,
-        model="gpt-5.6-sol",
+        model="gpt-3.5-turbo",
         reasoning_effort=None,
         api_key=None,
         api_key_file=None,
@@ -71,13 +67,15 @@ class LLMClient:
         max_requests=None,
         base_url="https://api.openai.com/v1",
     ):
-        if model not in _MODEL_EFFORTS:
-            raise ValueError("model must be gpt-5.6, gpt-5.6-sol, or gpt-6-astra")
-        effort = reasoning_effort
-        if effort is None:
-            effort = "low" if model == "gpt-6-astra" else "none"
-        if effort not in _MODEL_EFFORTS[model]:
-            raise ValueError("Unsupported reasoning_effort for {}: {}".format(model, effort))
+        if model == "gpt-3.5-turbo-0301":
+            raise ValueError("LOOP's gpt-3.5-turbo-0301 snapshot was shut down on 2024-09-13; "
+                             "configure gpt-3.5-turbo explicitly for a same-family run. "
+                             "No automatic model substitution is performed.")
+        if model not in SUPPORTED_MODELS:
+            raise ValueError("model must be a supported GPT-3.5 Turbo model: {}".format(
+                ", ".join(SUPPORTED_MODELS)))
+        if reasoning_effort not in (None, "none"):
+            raise ValueError("GPT-3.5 Turbo does not support reasoning_effort; use None")
         for name, value, minimum in (
             ("max_output_tokens", max_output_tokens, 1),
             ("max_retries", max_retries, 0),
@@ -87,11 +85,13 @@ class LLMClient:
                 continue
             if type(value) is not int or value < minimum:
                 raise ValueError("{} must be an integer >= {}".format(name, minimum))
+        if max_output_tokens > 4096:
+            raise ValueError("GPT-3.5 Turbo max_output_tokens must be <= 4096")
         if isinstance(timeout, bool) or not isinstance(timeout, (int, float)):
             raise ValueError("timeout must be a positive number")
         if timeout <= 0 or not math.isfinite(timeout):
             raise ValueError("timeout must be a positive finite number")
-        endpoint = base_url.rstrip("/") + "/responses"
+        endpoint = base_url.rstrip("/") + "/chat/completions"
         url = urlparse(endpoint)
         if url.scheme != "https" or not url.netloc or url.username or url.password:
             raise ValueError("base_url must be an HTTPS API base without embedded credentials")
@@ -99,7 +99,9 @@ class LLMClient:
             raise ValueError("base_url must not contain a query string or fragment")
 
         self.model = model
-        self.reasoning_effort = effort
+        # Kept as null in run metadata for compatibility; never sent to the API.
+        self.reasoning_effort = None
+        self.last_response_model = None
         self.max_output_tokens = max_output_tokens
         self.timeout = timeout
         self.max_retries = max_retries
@@ -245,7 +247,9 @@ class LLMClient:
         if not isinstance(usage, dict):
             return {}
         allowed = {"input_tokens", "output_tokens", "total_tokens", "cached_tokens",
-                   "reasoning_tokens", "input_tokens_details", "output_tokens_details"}
+                   "reasoning_tokens", "input_tokens_details", "output_tokens_details",
+                   "prompt_tokens", "completion_tokens", "prompt_tokens_details",
+                   "completion_tokens_details"}
         return {k: (cls._safe_usage(v) if isinstance(v, dict) else v)
                 for k, v in usage.items()
                 if k in allowed and (isinstance(v, dict) or (type(v) is int and v >= 0))}
@@ -271,14 +275,16 @@ class LLMClient:
     def _query(self, task, instructions, data, schema):
         payload = {
             "model": self.model,
-            "instructions": instructions,
-            "input": [{"role": "user", "content": json.dumps(data, ensure_ascii=False)}],
-            "reasoning": {"effort": self.reasoning_effort},
-            "max_output_tokens": self.max_output_tokens,
+            "messages": [
+                {"role": "system", "content": instructions + " JSON schema: " +
+                 json.dumps(schema, ensure_ascii=False)},
+                {"role": "user", "content": json.dumps(data, ensure_ascii=False)},
+            ],
+            "max_tokens": self.max_output_tokens,
             "store": False,
-            "text": {"format": {
-                "type": "json_schema", "name": task, "strict": True, "schema": schema,
-            }},
+            # GPT-3.5 supports JSON mode, not strict Structured Outputs.
+            # Validate the object and allowed choice indices again locally.
+            "response_format": {"type": "json_object"},
         }
         canonical = json.dumps({"version": PROMPT_VERSION, "endpoint": self.endpoint,
                                 "payload": payload}, sort_keys=True, ensure_ascii=False,
@@ -287,6 +293,9 @@ class LLMClient:
         if key in self._cache:
             entry = self._cache[key]
             answer = self._validate_answer(entry["answer"], schema)
+            metadata = entry.get("metadata") or {}
+            self._validate_response_model(metadata)
+            self.last_response_model = metadata["model"]
             self.cache_hits += 1
             self._log(key, task, "cache_hit", response=entry.get("metadata"), cache_hit=True)
             return copy.deepcopy(answer)
@@ -305,6 +314,7 @@ class LLMClient:
         entry = {"version": PROMPT_VERSION, "key": key, "answer": answer, "metadata": metadata}
         self._append_jsonl(self.cache_path, entry)
         self._cache[key] = entry
+        self.last_response_model = metadata["model"]
         self._log(key, task, "completed", time.monotonic() - started, response, cache_hit=False)
         return copy.deepcopy(answer)
 
@@ -358,7 +368,7 @@ class LLMClient:
                 elif status == 429:
                     detail = "check account quota and rate limits"
                 else:
-                    detail = "check configured model, reasoning effort, and request schema"
+                    detail = "check configured GPT-3.5 model and Chat Completions request schema"
                 raise LLMError("OpenAI HTTP {}: {}; no model switch or neighbor fallback was used".format(status, detail))
             try:
                 response = result.json()
@@ -371,39 +381,26 @@ class LLMClient:
 
     @classmethod
     def _parse_response(cls, response, schema):
-        if response.get("status") != "completed":
-            details = response.get("incomplete_details") or {}
-            reason = details.get("reason") if isinstance(details, dict) else None
-            if reason == "max_output_tokens":
-                raise LLMError("OpenAI response incomplete: max_output_tokens exhausted (reasoning and answer share this budget); no partial answer was accepted")
-            raise LLMError("OpenAI response did not complete; no answer was accepted")
+        cls._validate_response_model(response)
         if response.get("error"):
             raise LLMError("OpenAI response contains an error")
-        chunks = []
-        output = response.get("output")
-        if not isinstance(output, list):
-            raise LLMError("OpenAI response has no output list")
-        for item in output:
-            if not isinstance(item, dict) or item.get("type") != "message":
-                continue
-            if item.get("role") != "assistant":
-                continue
-            if item.get("status") not in (None, "completed"):
-                raise LLMError("OpenAI output message did not complete")
-            content = item.get("content")
-            if not isinstance(content, list):
-                raise LLMError("OpenAI output message has no content list")
-            for part in content:
-                if not isinstance(part, dict):
-                    raise LLMError("Malformed OpenAI output content")
-                if part.get("type") == "refusal":
-                    raise LLMError("OpenAI refused the relation query; no neighbor was substituted")
-                if part.get("type") == "output_text":
-                    text = part.get("text")
-                    if not isinstance(text, str):
-                        raise LLMError("Malformed OpenAI output text")
-                    chunks.append(text)
-        text = "".join(chunks).strip()
+        choices = response.get("choices")
+        if not isinstance(choices, list) or len(choices) != 1 or not isinstance(choices[0], dict):
+            raise LLMError("OpenAI response must contain exactly one completion choice")
+        choice = choices[0]
+        if choice.get("finish_reason") == "length":
+            raise LLMError("OpenAI response incomplete: max_tokens exhausted; no partial answer was accepted")
+        if choice.get("finish_reason") != "stop":
+            raise LLMError("OpenAI response did not complete normally; no answer was accepted")
+        message = choice.get("message")
+        if not isinstance(message, dict) or message.get("role") != "assistant":
+            raise LLMError("OpenAI response has no assistant message")
+        if message.get("refusal") or message.get("tool_calls") or message.get("function_call"):
+            raise LLMError("OpenAI refused or returned a tool call; no neighbor was substituted")
+        text = message.get("content")
+        if not isinstance(text, str):
+            raise LLMError("OpenAI answer content is not text")
+        text = text.strip()
         if not text:
             raise LLMError("OpenAI returned empty answer content")
         try:
@@ -411,6 +408,12 @@ class LLMClient:
         except ValueError:
             raise LLMError("OpenAI answer is not valid structured JSON") from None
         return cls._validate_answer(answer, schema)
+
+    @staticmethod
+    def _validate_response_model(response):
+        if not isinstance(response, dict) or response.get("model") not in SUPPORTED_MODELS:
+            raise LLMError("OpenAI response does not identify a supported GPT-3.5 Turbo model; "
+                           "no answer was accepted")
 
     @staticmethod
     def _validate_answer(answer, schema):

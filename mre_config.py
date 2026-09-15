@@ -10,8 +10,8 @@ OUTPUT_ROOT = ROOT / 'outputs'
 # API key is requested invisibly on the first uncached call. Alternatively,
 # point this to a PRIVATE text file outside this Git repository.
 API_KEY_FILE = None
-MODEL_NAME = 'gpt-5.6-sol'  # alternative: 'gpt-6-astra'
-REASONING_EFFORT = None  # None -> Sol: none; Astra: low
+MODEL_NAME = 'gpt-3.5-turbo'  # LOOP's 0301 snapshot is retired; log the actual API version
+REASONING_EFFORT = None  # GPT-3.5 has no reasoning mode; not sent to the API
 API_BASE = 'https://api.openai.com/v1'
 MAX_OUTPUT_TOKENS = 4096
 REQUEST_TIMEOUT = 120

@@ -48,8 +48,10 @@ def build_parser():
     parser.add_argument('--tokenizer', type=Path, default=defaults.TOKENIZER)
     parser.add_argument('--output-root', type=Path, default=defaults.OUTPUT_ROOT)
     parser.add_argument('--seed', type=int, default=defaults.SEED)
-    parser.add_argument('--model', choices=['gpt-5.6-sol', 'gpt-5.6', 'gpt-6-astra'], default=defaults.MODEL_NAME)
-    parser.add_argument('--reasoning-effort', default=defaults.REASONING_EFFORT)
+    parser.add_argument('--model', choices=['gpt-3.5-turbo', 'gpt-3.5-turbo-0125', 'gpt-3.5-turbo-1106'],
+                        default=defaults.MODEL_NAME)
+    parser.add_argument('--reasoning-effort', choices=['none'], default=defaults.REASONING_EFFORT,
+                        help='legacy compatibility only; GPT-3.5 has no reasoning mode')
     parser.add_argument('--api-key-file', type=Path, default=defaults.API_KEY_FILE)
     parser.add_argument('--max-requests', type=int, default=defaults.MAX_REQUESTS)
     parser.add_argument('--no-llm', action='store_true', help='same-protocol baseline, zero API calls')
@@ -160,7 +162,8 @@ def main(argv=None):
             'Head: Alice. Tail: Paris. Sentence: Alice was born in Paris.',
             ['Head: Bob. Tail: Rome. Sentence: Bob was born in Rome.',
              'Head: Carol. Tail: London. Sentence: Carol works in London.'])
-        print('Model: {}; effort: {}; answer: Choice {}'.format(client.model, client.reasoning_effort, answer + 1))
+        print('Requested model: {}; response model: {}; answer: Choice {}'.format(
+            client.model, client.last_response_model, answer + 1))
         return
     config = experiment_config(args)
     from mre_protocol import prepare_dataset

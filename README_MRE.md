@@ -97,17 +97,21 @@ GPT 只接收 `Head / Tail / Sentence` 和候选文本，不接收真实关系�
 
 ## 4. GPT 模型与 API key
 
-默认使用 `gpt-5.6-sol`，可改为 `gpt-6-astra`。模型名称及支持的思考档位以 [GPT-5.6 Sol 官方模型文档](https://developers.openai.com/api/docs/models/gpt-5.6-sol) 和 [GPT-6 Astra 官方模型文档](https://developers.openai.com/api/docs/models/gpt-6-astra) 为依据；账号是否具有该模型权限由实际 API 请求确认。
+默认使用 LOOP 论文中的 **GPT-3.5 Turbo 系列**，不再选择 GPT-5.6 或 GPT-6。论文第 4.1.4 节写明使用 GPT-3.5 Turbo API；原代码的邻居查询使用 `gpt-3.5-turbo-0301`，聚类命名使用 `gpt-3.5-turbo`。
+
+必须区分模型系列和历史快照：`gpt-3.5-turbo-0301` 已于 2024-09-13 停止服务，见 [OpenAI 停用说明](https://developers.openai.com/api/docs/deprecations)。本项目明确配置官方仍列出的 `gpt-3.5-turbo`，见 [GPT-3.5 Turbo 模型文档](https://developers.openai.com/api/docs/models/gpt-3.5-turbo)。这是同系列复现，不能声称使用了当年的相同快照；客户端拒绝 `0301` 配置，不会自动替换用户指定的模型。账号权限与网络连通性仍由实际请求确认。
 
 ```python
 # mre_config.py
-MODEL_NAME = 'gpt-5.6-sol'   # 或 'gpt-6-astra'
-REASONING_EFFORT = None
+MODEL_NAME = 'gpt-3.5-turbo'
+REASONING_EFFORT = None  # 不向 GPT-3.5 发送推理参数
 ```
 
-这里的 `None` 是本项目的自动配置：Sol 使用 `'none'`，Astra 使用 `'low'`。Astra 不支持 `'none'`，不要把它当作可关闭思考的同义设置。也可以显式写入该模型支持的其他档位。模型变化、档位变化、token 上限或候选文本变化都会形成不同缓存键。
+GPT-3.5 没有本项目此前 GPT-5/6 的推理档位；`None` 表示该参数不适用。旧命令的 `--reasoning-effort none` 仅兼容解析，不会发送到 API。可显式指定客户端支持的 GPT-3.5 快照，实际可访问性以账号请求为准。`llm_calls.jsonl` 同时记录请求模型和 API 返回的实际模型版本；非 GPT-3.5 响应会被拒绝。
 
-客户端通过 `requests` 请求 OpenAI `/v1/responses`，采用 [Structured Outputs](https://developers.openai.com/api/docs/guides/structured-outputs)，不依赖新版 OpenAI SDK，因此不需要仅为此升级服务器已有的 `openai==0.28.0`。默认 `max_output_tokens=4096` 同时约束思考与答案；耗尽预算的输出不会被接受。
+客户端通过 `requests` 请求 OpenAI `/v1/chat/completions`，使用 JSON mode（`response_format={"type":"json_object"}`），再在本地校验答案字段与候选编号；不发送 GPT-3.5 不支持的严格 JSON Schema 或推理参数。不依赖新版 OpenAI SDK，无须为此升级服务器已有的 `openai==0.28.0`。配置 `MAX_OUTPUT_TOKENS=4096` 转换为该接口的 `max_tokens`，限制生成答案的 token 数；截断、空回答、拒答和非法 JSON 都不会作为训练监督使用。相对原版 `Choice 1/2` 文本，这里保留当前 MRE 分支的 JSON 答案契约，提示词仍比较有方向的关系。
+
+缓存版本和请求端点已经更新，旧 GPT-5/6 回答不会混用。客户端不显式设置采样 temperature，与原 LOOP 调用同样采用 API 默认值；重复请求仍不保证完全确定。模型、token 上限、提示词、候选顺序或文本变化会形成不同缓存键。
 
 不需要 `export`。默认首次实际请求时隐藏输入 API key。需要非交互运行时，把 key 保存为服务器上仓库之外的私人文本文件，并在配置中指定：
 
@@ -140,7 +144,7 @@ cd LOOP-MRE-mre-protocol
 SOURCE_DIR = Path('/home/zhoubaohang/FewRel')
 BERT_MODEL = Path('/home/zhoubaohang/jiangyipeng/LOOP/pretrained/bert-base-uncased')
 TOKENIZER = BERT_MODEL
-MODEL_NAME = 'gpt-5.6-sol'
+MODEL_NAME = 'gpt-3.5-turbo'
 REASONING_EFFORT = None
 ```
 
@@ -161,7 +165,7 @@ python run_mre.py --check-data
 python run_mre.py --check-llm
 ```
 
-应看到请求的模型、实际配置档位和 `Choice 1` 或 `Choice 2`。如果返回权限或模型错误，先修正 key/账号权限/配置，不要绕过错误继续训练。
+应看到请求模型、API 返回的实际模型版本和 `Choice 1` 或 `Choice 2`。如果返回权限或模型错误，先修正 key/账号权限/配置，不要绕过错误继续训练。之前服务器到 `api.openai.com` 的连接超时不会因更换模型自动解决。
 
 **第五步：短流程检查。**
 
@@ -183,10 +187,10 @@ python run_mre.py --no-llm --seed 1
 python run_mre.py --no-llm --seed 2
 ```
 
-`--no-llm` 在同一套 MRE 数据、训练和评估流程下禁用 GPT，保留随机近邻选择，是判断 GPT 是否带来收益的必要对照。使用 Astra 的单次实验示例：
+`--no-llm` 在同一套 MRE 数据、训练和评估流程下禁用 GPT，保留随机近邻选择，是判断 GPT 是否带来收益的必要对照。GPT-3.5 的有限请求短测试示例：
 
 ```bash
-python run_mre.py --model gpt-6-astra --reasoning-effort low --seed 0
+python run_mre.py --model gpt-3.5-turbo --smoke --max-requests 20 --seed 0
 ```
 
 此处 `seed` 同时影响样本划分与训练随机性；换 seed 不是仅换模型初始化。应报告三个 seed 各自结果以及均值、标准差，并明确这是跨划分和训练随机性的统计。同 seed 的方法比较还应核对原文件哈希、manifest、参数和库版本；不要仅凭种子数字相同就声称所有随机过程完全配对。
@@ -218,7 +222,7 @@ python run_mre.py --evaluate-run outputs/mre_seed0_替换为实际时间
 
 复核时会验证 config 中保存的 manifest 指纹，以及已保存预测的样本 ID、标签和顺序；不匹配则报错。检查生成的 `reevaluation.json` 中 `predictions_identical` 是否为 `true`。该功能是推理复核，**不是精确断点续训**；当前没有保存完整优化器、调度器、采样器和全部随机状态以恢复中断训练。
 
-对导师建议至少汇报：数据来源与 64/16 名单、传导式协议、各 seed 数据量、重复/歧义和截断审计、LLM 型号/思考档位/实际请求量、GPT 与无 GPT 的三项指标及均值/标准差。不要将簇名称看起来合理视为分类准确率正确的证据。
+对导师建议至少汇报：数据来源与 64/16 名单、传导式协议、各 seed 数据量、重复/歧义和截断审计、LLM 请求型号/API 返回版本/实际请求量、GPT 与无 GPT 的三项指标及均值/标准差。不要将簇名称看起来合理视为分类准确率正确的证据。
 
 ## 7. 实现依据与检查
 
@@ -226,7 +230,7 @@ python run_mre.py --evaluate-run outputs/mre_seed0_替换为实际时间
 
 上游 LOOP 基线来自 [Lackel/LOOP](https://github.com/Lackel/LOOP) 及本仓库修改前的 commit `7b139f4a5ed41cf52baead68d7a98b88571466ae`。新增入口的核心模块为 `mre_protocol.py`、`mre_data.py`、`mre_neighbors.py`、`mre_trainer.py`、`mre_metrics.py` 和 `llm_client.py`。
 
-自动化测试位于 `tests/`，覆盖数据划分与标签隔离、指标与 MRE 参考实现的一致性、近邻逻辑及模拟 Responses 请求；执行时不需要真实 API key：
+自动化测试位于 `tests/`，覆盖数据划分与标签隔离、指标与 MRE 参考实现的一致性、近邻逻辑及模拟 GPT-3.5 Chat Completions 请求；执行时不需要真实 API key：
 
 ```bash
 python -m pytest tests -q
@@ -234,4 +238,6 @@ python -m pytest tests -q
 
 自动化检查不能替代服务器真实数据、GPU 训练及账号 API 可用性验证。不要把离线测试通过写成“已经跑出正式实验结果”。
 
-本次提交的本地验证：103 项离线测试通过（协议 10、指标 6、数据加载 8、客户端 70、近邻/训练/复核 9），并通过 Python 3.8 语法检查。训练集成测试用随机初始化的单层小型 BERT 和合成的 2 base / 1 novel 数据，完成 CE+MLM、CE+RNCL、保存和重新加载，验证预测一致且评估不会调用 KMeans.fit；64/16 类别约束另有协议测试覆盖。训练测试环境为 Python 3.9、CPU PyTorch 2.8、Transformers 4.2.1，故仍需在服务器原 Python 3.8 / GPU 环境完成 smoke 检查。本次未使用服务器真实数据进行训练，也未发起真实付费 API 请求。
+初始协议版本的历史验证：103 项离线测试通过（协议 10、指标 6、数据加载 8、客户端 70、近邻/训练/复核 9），并通过 Python 3.8 语法检查。训练集成测试用随机初始化的单层小型 BERT 和合成的 2 base / 1 novel 数据，完成 CE+MLM、CE+RNCL、保存和重新加载，验证预测一致且评估不会调用 KMeans.fit；64/16 类别约束另有协议测试覆盖。当时训练测试环境为 Python 3.9、CPU PyTorch 2.8、Transformers 4.2.1。
+
+本次 GPT-3.5 迁移验证：94 项客户端测试和 6 项无 BERT 的入口测试通过，修改文件通过 Python 3.8 语法及 diff 检查。系统 pytest 插件自动加载会干扰本地测试，关闭插件自动发现后通过。本次 BERT 集成测试在收集阶段被本地全局 Transformers 5.2.0 与 Python 3.9 的 `UnionType` 导入不兼容阻塞；没有修改服务器依赖，也没有重新验证 GPU 训练。上述历史训练结果不能代替本次服务器 smoke。本次未使用真实数据训练或发起付费 API 请求。

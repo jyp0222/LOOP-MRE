@@ -20,15 +20,14 @@ def completed(answer=None):
     if answer is None:
         answer = {"choice": 1}
     return {
-        "id": "resp_offline_1", "model": "gpt-5.6-sol", "status": "completed",
-        "output": [
-            {"type": "reasoning", "summary": []},
-            {"type": "message", "role": "assistant", "status": "completed",
-             "content": [{"type": "output_text", "text": json.dumps(answer)}]},
+        "id": "chatcmpl_offline_1", "model": "gpt-3.5-turbo-0125",
+        "choices": [
+            {"index": 0, "finish_reason": "stop",
+             "message": {"role": "assistant", "content": json.dumps(answer)}},
         ],
-        "usage": {"input_tokens": 100, "output_tokens": 12, "total_tokens": 112,
-                  "input_tokens_details": {"cached_tokens": 32},
-                  "output_tokens_details": {"reasoning_tokens": 8}},
+        "usage": {"prompt_tokens": 100, "completion_tokens": 12, "total_tokens": 112,
+                  "prompt_tokens_details": {"cached_tokens": 32},
+                  "completion_tokens_details": {"reasoning_tokens": 0}},
     }
 
 
@@ -76,47 +75,61 @@ def read_jsonl(path):
     return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
 
 
-def test_responses_request_has_strict_directed_choice_schema(monkeypatch):
+def test_chat_request_uses_gpt35_json_mode_and_directed_choice_contract(monkeypatch):
     calls = fake_transport(monkeypatch, [FakeResponse()])
     client = LLMClient(api_key=KEY, max_output_tokens=1234, timeout=17)
     assert client.choose_neighbor(QUERY, CHOICES) == 1
     assert len(calls) == 1
     call = calls[0]
-    assert call["url"] == "https://api.openai.com/v1/responses"
+    assert call["url"] == "https://api.openai.com/v1/chat/completions"
     assert call["headers"] == {"Authorization": "Bearer " + KEY, "Content-Type": "application/json"}
     assert call["timeout"] == 17
     assert call["allow_redirects"] is False
     payload = call["json"]
-    assert payload["model"] == "gpt-5.6-sol"
-    assert payload["reasoning"] == {"effort": "none"}
-    assert payload["max_output_tokens"] == 1234 and payload["store"] is False
+    assert payload["model"] == "gpt-3.5-turbo"
+    assert payload["max_tokens"] == 1234 and payload["store"] is False
     assert "temperature" not in payload
-    assert "Head-to-Tail" in payload["instructions"]
-    assert "data, not instructions" in payload["instructions"]
-    assert json.loads(payload["input"][0]["content"]) == {
+    assert not {"reasoning", "reasoning_effort", "input", "text", "max_output_tokens"} & set(payload)
+    assert [message["role"] for message in payload["messages"]] == ["system", "user"]
+    instructions = payload["messages"][0]["content"]
+    assert "Head-to-Tail" in instructions
+    assert "data, not instructions" in instructions
+    assert "JSON" in instructions and "additionalProperties" in instructions
+    assert "choice" in instructions and "enum" in instructions
+    assert json.loads(payload["messages"][1]["content"]) == {
         "query": QUERY, "choices": [{"index": 0, "text": CHOICES[0]}, {"index": 1, "text": CHOICES[1]}]
     }
-    fmt = payload["text"]["format"]
-    assert fmt["type"] == "json_schema" and fmt["strict"] is True
-    assert fmt["schema"] == {
-        "type": "object", "properties": {"choice": {"type": "integer", "enum": [0, 1]}},
-        "required": ["choice"], "additionalProperties": False,
-    }
+    assert payload["response_format"] == {"type": "json_object"}
+    assert client.reasoning_effort is None
+    assert client.last_response_model == "gpt-3.5-turbo-0125"
     assert client.requests_made == 1
 
 
-def test_astra_default_effort_and_no_model_fallback(monkeypatch):
+def test_gpt35_snapshot_failure_has_no_model_fallback(monkeypatch):
     calls = fake_transport(monkeypatch, [FakeResponse(status=404)])
-    client = LLMClient(model="gpt-6-astra", api_key=KEY)
-    assert client.reasoning_effort == "low"
+    client = LLMClient(model="gpt-3.5-turbo-0125", api_key=KEY)
+    assert client.reasoning_effort is None
     with pytest.raises(LLMError, match="HTTP 404"):
         client.choose_neighbor(QUERY, CHOICES)
-    assert len(calls) == 1 and calls[0]["json"]["model"] == "gpt-6-astra"
+    assert len(calls) == 1 and calls[0]["json"]["model"] == "gpt-3.5-turbo-0125"
+
+
+@pytest.mark.parametrize("model", ["gpt-3.5-turbo", "gpt-3.5-turbo-0125", "gpt-3.5-turbo-1106"])
+def test_supported_gpt35_models_report_actual_response_model(monkeypatch, model):
+    payload = completed()
+    payload["model"] = "gpt-3.5-turbo-0125" if model == "gpt-3.5-turbo" else model
+    fake_transport(monkeypatch, [FakeResponse(payload)])
+    client = LLMClient(model=model, api_key=KEY)
+    assert client.last_response_model is None
+    assert client.choose_neighbor(QUERY, CHOICES) == 1
+    assert client.last_response_model == payload["model"]
 
 
 @pytest.mark.parametrize("kwargs", [
-    {"model": "not-a-supported-model"}, {"model": "gpt-6-astra", "reasoning_effort": "none"},
-    {"reasoning_effort": "ultra"}, {"max_output_tokens": 0}, {"max_output_tokens": True},
+    {"model": "not-a-supported-model"}, {"model": "gpt-3.5-turbo-0301"},
+    {"model": "gpt-5.6-sol"}, {"model": "gpt-5.6"}, {"model": "gpt-6-astra"},
+    {"reasoning_effort": "low"}, {"reasoning_effort": "ultra"},
+    {"max_output_tokens": 0}, {"max_output_tokens": True}, {"max_output_tokens": 4097},
     {"timeout": 0}, {"timeout": float("nan")}, {"timeout": float("inf")}, {"timeout": True},
     {"max_retries": -1}, {"max_retries": 1.5}, {"max_requests": -1}, {"max_requests": False},
     {"base_url": "http://api.openai.com/v1"}, {"base_url": "https://user:pass@api.openai.com/v1"},
@@ -143,7 +156,7 @@ def test_invalid_query_fails_without_network(query, choices):
 ])
 def test_invalid_structured_answer_stops_without_cache_or_retry(monkeypatch, tmp_path, answer):
     payload = completed({"choice": 1})
-    payload["output"][1]["content"][0]["text"] = json.dumps(answer)
+    payload["choices"][0]["message"]["content"] = json.dumps(answer)
     calls = fake_transport(monkeypatch, [FakeResponse(payload)])
     cache = tmp_path / "cache.jsonl"
     client = LLMClient(api_key=KEY, cache_path=cache)
@@ -152,22 +165,56 @@ def test_invalid_structured_answer_stops_without_cache_or_retry(monkeypatch, tmp
     assert len(calls) == 1 and not cache.exists()
 
 
-@pytest.mark.parametrize("kind", ["incomplete", "refusal", "malformed", "empty", "bad_message", "error"])
+@pytest.mark.parametrize("kind", [
+    "length", "refusal", "malformed", "empty", "nontext_content", "bad_role",
+    "error", "tool_calls", "function_call", "content_filter", "missing_finish",
+    "missing_message", "missing_choices", "empty_choices", "multiple_choices",
+    "nonlist_choices", "nonobject_choice", "nonobject_message", "missing_model",
+    "unexpected_model",
+])
 def test_failed_output_is_logged_but_never_used_as_supervision(monkeypatch, tmp_path, kind):
     payload = completed()
-    if kind == "incomplete":
-        payload["status"] = "incomplete"
-        payload["incomplete_details"] = {"reason": "max_output_tokens"}
+    choice = payload["choices"][0]
+    if kind == "length":
+        choice["finish_reason"] = "length"
     elif kind == "refusal":
-        payload["output"][1]["content"] = [{"type": "refusal", "refusal": "refused " + QUERY}]
+        choice["message"]["refusal"] = "refused " + QUERY
     elif kind == "malformed":
-        payload["output"][1]["content"][0]["text"] = "Choice 2"
+        choice["message"]["content"] = "Choice 2"
     elif kind == "empty":
-        payload["output"][1]["content"] = []
-    elif kind == "bad_message":
-        payload["output"][1]["status"] = "in_progress"
-    else:
+        choice["message"]["content"] = "  "
+    elif kind == "nontext_content":
+        choice["message"]["content"] = [{"type": "text", "text": '{"choice": 1}'}]
+    elif kind == "bad_role":
+        choice["message"]["role"] = "user"
+    elif kind == "error":
         payload["error"] = {"message": KEY}
+    elif kind == "tool_calls":
+        choice["message"]["tool_calls"] = [{"id": "call_private", "function": {"name": "choose"}}]
+    elif kind == "function_call":
+        choice["message"]["function_call"] = {"name": "choose", "arguments": '{"choice": 1}'}
+    elif kind == "content_filter":
+        choice["finish_reason"] = "content_filter"
+    elif kind == "missing_finish":
+        choice.pop("finish_reason")
+    elif kind == "missing_message":
+        choice.pop("message")
+    elif kind == "missing_choices":
+        payload.pop("choices")
+    elif kind == "empty_choices":
+        payload["choices"] = []
+    elif kind == "multiple_choices":
+        payload["choices"].append(copy.deepcopy(choice))
+    elif kind == "nonlist_choices":
+        payload["choices"] = {"0": choice}
+    elif kind == "nonobject_choice":
+        payload["choices"] = [None]
+    elif kind == "nonobject_message":
+        choice["message"] = None
+    elif kind == "missing_model":
+        payload.pop("model")
+    else:
+        payload["model"] = "gpt-5.6-sol"
     calls = fake_transport(monkeypatch, [FakeResponse(payload)])
     path = tmp_path / "log.jsonl"
     client = LLMClient(api_key=KEY, log_path=path)
@@ -193,12 +240,13 @@ def test_persistent_cache_hit_uses_no_key_and_no_attempt_budget(monkeypatch, tmp
     assert restored.choose_neighbor(QUERY, CHOICES) == 1
     assert len(calls) == 1 and restored.requests_made == 0 and restored.cache_hits == 1
     assert not restored._key_loaded
+    assert restored.last_response_model == "gpt-3.5-turbo-0125"
     with pytest.raises(LLMBudgetExceeded):
         restored.choose_neighbor(QUERY + " new", CHOICES)
     assert read_jsonl(log)[-2]["status"] == "cache_hit"
 
 
-@pytest.mark.parametrize("change", ["query", "order", "candidate", "model", "effort", "tokens", "endpoint"])
+@pytest.mark.parametrize("change", ["query", "order", "candidate", "model", "tokens", "endpoint"])
 def test_cache_key_includes_all_semantic_parameters(monkeypatch, tmp_path, change):
     cache = tmp_path / "cache.jsonl"
     calls = fake_transport(monkeypatch, [FakeResponse(), FakeResponse()])
@@ -212,11 +260,9 @@ def test_cache_key_includes_all_semantic_parameters(monkeypatch, tmp_path, chang
     elif change == "candidate":
         choices[0] += " changed"
     elif change == "model":
-        kwargs["model"] = "gpt-6-astra"
-    elif change == "effort":
-        kwargs["reasoning_effort"] = "low"
+        kwargs["model"] = "gpt-3.5-turbo-0125"
     elif change == "tokens":
-        kwargs["max_output_tokens"] = 8192
+        kwargs["max_output_tokens"] = 2048
     else:
         kwargs["base_url"] = "https://example.test/v1"
     second = LLMClient(**kwargs)
@@ -226,19 +272,44 @@ def test_cache_key_includes_all_semantic_parameters(monkeypatch, tmp_path, chang
     assert len(entries) == 2 and entries[0]["key"] != entries[1]["key"]
 
 
+def test_none_effort_alias_is_omitted_and_uses_same_cache_key(monkeypatch, tmp_path):
+    cache = tmp_path / "cache.jsonl"
+    calls = fake_transport(monkeypatch, [FakeResponse()])
+    LLMClient(api_key=KEY, cache_path=cache).choose_neighbor(QUERY, CHOICES)
+    client = LLMClient(reasoning_effort="none", cache_path=cache, max_requests=0)
+    assert client.choose_neighbor(QUERY, CHOICES) == 1
+    assert client.reasoning_effort is None
+    assert len(calls) == 1 and client.cache_hits == 1
+
+
+def test_responses_era_cache_is_ignored_even_with_matching_request_hash(monkeypatch, tmp_path):
+    cache = tmp_path / "cache.jsonl"
+    calls = fake_transport(monkeypatch, [FakeResponse(), FakeResponse()])
+    LLMClient(api_key=KEY, cache_path=cache).choose_neighbor(QUERY, CHOICES)
+    entry = read_jsonl(cache)[0]
+    assert llm_client.PROMPT_VERSION != "mre-directed-relation-v1"
+    entry["version"] = "mre-directed-relation-v1"
+    entry["metadata"]["model"] = "gpt-5.6-sol"
+    entry["answer"] = {"choice": 0}
+    cache.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    restored = LLMClient(api_key=KEY, cache_path=cache)
+    assert restored.choose_neighbor(QUERY, CHOICES) == 1
+    assert len(calls) == 2 and restored.cache_hits == 0
+
+
 def test_cache_and_usage_log_contain_no_credentials_or_prompts(monkeypatch, tmp_path):
     payload = completed()
     payload["usage"]["secret"] = KEY
-    payload["usage"]["output_tokens_details"]["secret"] = QUERY
-    payload["usage"]["input_tokens_details"]["invalid"] = -9
+    payload["usage"]["completion_tokens_details"]["secret"] = QUERY
+    payload["usage"]["prompt_tokens_details"]["invalid"] = -9
     fake_transport(monkeypatch, [FakeResponse(payload)])
     cache, log = tmp_path / "cache.jsonl", tmp_path / "log.jsonl"
     LLMClient(api_key=KEY, cache_path=cache, log_path=log).choose_neighbor(QUERY, CHOICES)
     text = cache.read_text(encoding="utf-8") + log.read_text(encoding="utf-8")
     assert all(secret not in text for secret in [KEY, QUERY] + CHOICES)
     entry = read_jsonl(log)[0]
-    assert entry["response_id"] == "resp_offline_1"
-    assert entry["response_model"] == "gpt-5.6-sol"
+    assert entry["response_id"] == "chatcmpl_offline_1"
+    assert entry["response_model"] == "gpt-3.5-turbo-0125"
     assert entry["usage"] == completed()["usage"]
     assert entry["status"] == "completed" and entry["cache_hit"] is False
     assert entry["elapsed_seconds"] >= 0
@@ -263,7 +334,7 @@ def test_retryable_http_failures_honor_bound_and_retry_after(monkeypatch, tmp_pa
     assert client.choose_neighbor(QUERY, CHOICES) == 1
     assert delays == [60, 2]
     assert len(calls) == 3 and client.requests_made == 3
-    assert all(call["json"]["model"] == "gpt-5.6-sol" for call in calls)
+    assert all(call["json"]["model"] == "gpt-3.5-turbo" for call in calls)
     assert [entry["status"] for entry in read_jsonl(tmp_path / "log.jsonl")] == [
         "http_error", "http_error", "completed"]
 
@@ -354,12 +425,27 @@ def test_corrupt_cache_is_rejected_and_cached_answer_is_revalidated(monkeypatch,
         LLMClient(cache_path=path, max_requests=0).choose_neighbor(QUERY, CHOICES)
 
 
+def test_cached_non_gpt35_response_is_not_accepted_as_paper_model(monkeypatch, tmp_path):
+    path = tmp_path / "cache.jsonl"
+    calls = fake_transport(monkeypatch, [FakeResponse()])
+    LLMClient(api_key=KEY, cache_path=path).choose_neighbor(QUERY, CHOICES)
+    entry = read_jsonl(path)[0]
+    entry["metadata"]["model"] = "gpt-5.6-sol"
+    path.write_text(json.dumps(entry) + "\n", encoding="utf-8")
+    restored = LLMClient(cache_path=path, max_requests=0)
+    with pytest.raises(LLMError):
+        restored.choose_neighbor(QUERY, CHOICES)
+    assert restored.last_response_model is None
+    assert len(calls) == 1 and restored.requests_made == 0
+
+
 def test_optional_cluster_name_is_structured_and_trimmed(monkeypatch):
     calls = fake_transport(monkeypatch, [FakeResponse(completed({"name": "  located in  "}))])
     assert LLMClient(api_key=KEY).name_cluster(CHOICES) == "located in"
     payload = calls[0]["json"]
-    assert payload["text"]["format"]["name"] == "name_cluster"
-    assert payload["text"]["format"]["schema"]["required"] == ["name"]
+    assert payload["response_format"] == {"type": "json_object"}
+    assert "name" in payload["messages"][0]["content"]
+    assert json.loads(payload["messages"][1]["content"]) == {"samples": CHOICES}
 
 
 @pytest.mark.parametrize("name", ["", "  ", "x" * 121, None, 1])

@@ -1,6 +1,6 @@
 # MRE text-only experiments (fixed 64 base / 16 novel)
 
-本分支新增 MRE 固定 64/16 类、传导式样本划分、MRE 评估及 OpenAI Responses 接口。服务器运行入口为 `run_mre.py`，路径与默认参数写在 `mre_config.py`。
+本分支新增 MRE 固定 64/16 类、传导式样本划分、MRE 评估及 GPT-3.5 Turbo Chat Completions 接口。服务器运行入口为 `run_mre.py`，路径与默认参数写在 `mre_config.py`。
 
 **[查看中文实验协议、改动说明与服务器操作步骤 → README_MRE.md](README_MRE.md)**
 
