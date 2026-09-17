@@ -19,45 +19,49 @@ def predict_clusters(features, centers):
     return squared_distances(features, centers).argmin(axis=1)
 
 
-def mine_neighbors(features, pseudo_labels, centers, topk=20, query_pool_size=500):
-    """Retain upstream IP similarity, q/p formula and softmax-entropy ranking.
+def mine_neighbors(features, pseudo_labels, centers, topk=50, query_pool_size=500):
+    """Upstream raw inner-product FAISS retrieval and Torch LIS ranking.
 
-    Self is explicitly placed first, instead of assuming raw inner-product
-    search necessarily retrieves self first. Blocked NumPy avoids a mandatory
-    GPU FAISS dependency. No ground-truth label argument exists here.
+    Do not force self into slot zero: preserve the original search result.
+    Ground-truth labels are deliberately absent from this interface.
     """
-    features = np.asarray(features, dtype=np.float32)
+    import torch
+    import torch.nn.functional as F
+    try:
+        import faiss
+    except ImportError as exc:
+        raise ImportError('Original LOOP retrieval requires faiss: install faiss-gpu in the server environment '
+                          '(or faiss-cpu for CPU testing).') from exc
+    features = np.ascontiguousarray(features, dtype=np.float32)
+    centers = np.asarray(centers, dtype=np.float32)
     pseudo_labels = np.asarray(pseudo_labels)
-    distances = squared_distances(features, centers)
+    squared_distances(features, centers)  # validate shape/finite values
     n = len(features)
     if (n < 2 or topk < 1 or query_pool_size < 0 or pseudo_labels.shape != (n,)
             or pseudo_labels.dtype.kind not in 'iu' or np.any(pseudo_labels < 0)
             or np.any(pseudo_labels >= len(centers))):
         raise ValueError('Invalid neighbor mining dimensions or budget')
     k = min(topk, n - 1)
-    indices = np.empty((n, k + 1), dtype=np.int64)
-    indices[:, 0] = np.arange(n)
-    for start in range(0, n, 256):
-        stop = min(start + 256, n)
-        scores = features[start:stop].dot(features.T)
-        scores[np.arange(stop - start), np.arange(start, stop)] = -np.inf
-        indices[start:stop, 1:] = np.argsort(-scores, axis=1, kind='stable')[:, :k]
-    # This intentionally follows utils/memory.py, including its q**2 / 2 and
-    # softmax(p) operations. Changing these to the paper formula is a separate
-    # methodological ablation, not part of the requested protocol migration.
-    q = 1.0 / (1.0 + distances)
+    index = faiss.IndexFlatIP(features.shape[1])
+    if hasattr(faiss, 'get_num_gpus') and faiss.get_num_gpus() > 0:
+        index = faiss.index_cpu_to_all_gpus(index)
+    index.add(features)
+    _, indices = index.search(features, k + 1)
+    tensor_features = torch.from_numpy(features)
+    q = 1.0 / (1.0 + torch.sum((tensor_features.unsqueeze(1) - centers) ** 2, dim=2))
     q = q ** 2 / 2.0
-    q /= q.sum(axis=1, keepdims=True)
-    weight = q ** 2 / np.maximum(q.sum(axis=0), np.finfo(np.float32).tiny)
-    p = weight / weight.sum(axis=1, keepdims=True)
-    softmax_p = np.exp(p - p.max(axis=1, keepdims=True))
-    softmax_p /= softmax_p.sum(axis=1, keepdims=True)
-    entropy = -(softmax_p * np.log(softmax_p)).sum(axis=1)
-    inconsistent = (pseudo_labels[indices[:, 1:]] != pseudo_labels[:, None]).sum(axis=1)
-    budget = min(query_pool_size, n)
-    high_entropy = set(np.argsort(-entropy, kind='stable')[:budget].tolist())
-    selected = [int(i) for i in np.argsort(-inconsistent, kind='stable')[:budget]
-                if int(i) in high_entropy]
+    q = (q.t() / torch.sum(q, dim=1)).t()
+    weight = q ** 2 / torch.sum(q, dim=0)
+    p = (weight.t() / torch.sum(weight, dim=1)).t()
+    prob = F.softmax(p, dim=-1)
+    entropy = -torch.sum(prob * torch.log(prob), 1)
+    _, entropy_order = torch.sort(entropy, descending=True)
+    # Upstream drops the FIRST result for inconsistency, rather than finding self.
+    inconsistent = torch.from_numpy(
+        (pseudo_labels[indices[:, 1:]] != pseudo_labels[:, None]).sum(axis=1))
+    _, inconsistency_order = torch.sort(inconsistent, descending=True)
+    selected = [int(i) for i in inconsistency_order[:query_pool_size]
+                if i in entropy_order[:query_pool_size]]
     return indices, selected
 
 
@@ -65,7 +69,7 @@ def cap_query_candidates(indices, pseudo_labels, selected, limit=None):
     """Bound smoke queries after normal selection, keeping its ranking order.
 
     Only anchors with two distinct neighbor pseudo-classes can reach the LLM
-    in NeighborPairs. Self is excluded exactly as in that dataset. No gold
+    in NeighborPairs. The full retrieved row (self eligible) is used. No gold
     labels are used, and uncapped formal runs keep the original selection.
     """
     if limit is None:
@@ -77,8 +81,7 @@ def cap_query_candidates(indices, pseudo_labels, selected, limit=None):
     for index in selected:
         if len(capped) >= limit:
             break
-        others = indices[index][indices[index] != index]
-        if len(np.unique(pseudo_labels[others])) >= 2:
+        if len(np.unique(pseudo_labels[indices[index]])) >= 2:
             capped.append(int(index))
     return capped
 

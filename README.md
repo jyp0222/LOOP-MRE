@@ -1,6 +1,6 @@
 # MRE text-only experiments (fixed 64 base / 16 novel)
 
-本分支新增 MRE 固定 64/16 类、传导式样本划分、MRE 评估及 GPT-3.5 Turbo Chat Completions 接口。服务器运行入口为 `run_mre.py`，路径与默认参数写在 `mre_config.py`。
+本分支在保留 MRE 固定 64/16 类、传导式样本划分和 MRE 计分的前提下，恢复原 LOOP 的普通随机采样、k=50、batch=64/128/64、RTR、末轮模型及测试集 KMeans。邻居请求 `gpt-3.5-turbo-0301`（中转站实际快照未核实），命名请求原版的 `gpt-3.5-turbo`。服务器入口为 `run_mre.py`，参数写在 `mre_config.py`，新实验标识为 `loop_original_mre_v1`。
 
 **[查看中文实验协议、改动说明与服务器操作步骤 → README_MRE.md](README_MRE.md)**
 

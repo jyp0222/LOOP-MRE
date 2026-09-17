@@ -1,7 +1,9 @@
 """Offline integration: real tiny BERT, synthetic text, no downloaded weights/API."""
 import json
+import ast
 import hashlib
 from pathlib import Path
+from types import SimpleNamespace
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -14,7 +16,7 @@ from mre_data import MREData
 from mre_metrics import mre_accuracy
 from mre_neighbors import adjacency_mask, mine_neighbors, predict_clusters
 from mre_protocol import prepare_dataset
-from mre_trainer import MRETrainer, NeighborPairs, score_loader
+from mre_trainer import MRETrainer, NeighborPairs, cluster_score_loader
 from run_mre import build_parser, experiment_config, evaluate_saved_run, load_data, main
 
 
@@ -49,13 +51,35 @@ class NeighborsTests(unittest.TestCase):
         self.assertEqual(mask[0, 1], 1)
         self.assertEqual(mask[0, 2], 0)
 
-    def test_self_first_even_when_inner_product_prefers_other(self):
+    def test_raw_inner_product_order_does_not_force_self_first(self):
         features = np.array([[1., 0.], [4., 0.], [0., 1.]])
         centers = features[[0, 2]]
         indices, queries = mine_neighbors(features, np.array([0, 0, 1]), centers, 2, 3)
-        np.testing.assert_array_equal(indices[:, 0], np.arange(3))
+        np.testing.assert_array_equal(indices[:, 0], [1, 1, 2])
         self.assertTrue(all(len(set(row)) == 3 for row in indices))
         self.assertEqual(set(queries), {0, 1, 2})
+
+    def test_retrieval_and_lis_ranking_match_original_source(self):
+        import faiss
+        import torch.nn.functional as F
+        from scipy.optimize import linear_sum_assignment
+        original = Path(__file__).resolve().parents[1] / 'utils' / 'memory.py'
+        tree = ast.parse(original.read_text())
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == 'MemoryBank')
+        namespace = dict(torch=torch, np=np, F=F, linear_sum_assignment=linear_sum_assignment)
+        exec(compile(ast.Module(body=[cls], type_ignores=[]), str(original), 'exec'), namespace)
+        rng = np.random.RandomState(7)
+        features = rng.randn(620, 8).astype(np.float32)
+        centers = features[::62].copy()
+        pseudo = predict_clusters(features, centers)
+        bank = namespace['MemoryBank'](620, 8, 10, .1)
+        bank.features = torch.from_numpy(features)
+        bank.targets = torch.zeros(620, dtype=torch.long)
+        with patch.object(faiss, 'index_cpu_to_all_gpus', lambda index: index, create=True):
+            old_indices, old_selected = bank.mine_nearest_neighbors(50, pseudo, centers)
+            indices, selected = mine_neighbors(features, pseudo, centers, 50, 500)
+        np.testing.assert_array_equal(indices, old_indices)
+        self.assertEqual(selected, [int(i) for i in old_selected])
 
     def test_no_queries_when_budget_zero(self):
         features = np.eye(3)
@@ -89,7 +113,42 @@ def make_source(path):
 
 
 class TrainingIntegrationTests(unittest.TestCase):
-    def test_real_tiny_bert_training_best_checkpoint_and_fixed_prediction(self):
+    def test_pretrain_equal_accuracy_keeps_first_checkpoint_and_stops_after_patience(self):
+        class Toy(torch.nn.Module):
+            def __init__(self, *args):
+                super().__init__()
+                self.weight = torch.nn.Parameter(torch.zeros(()))
+                self.backbone = SimpleNamespace(config=SimpleNamespace(hidden_size=768))
+                self.loss_ce = torch.nn.CrossEntropyLoss()
+            def forward(self, inputs):
+                # Always predict class 0: validation stays at exactly 50%.
+                logits = torch.tensor([[2., 0.]], device=self.weight.device).repeat(len(inputs['input_ids']), 1)
+                return {'logits': logits + self.weight * 0}
+            def save_backbone(self, path):
+                pass
+
+        tensors = torch.utils.data.TensorDataset(torch.ones(2, 4, dtype=torch.long),
+            torch.ones(2, 4, dtype=torch.long), torch.zeros(2, 4, dtype=torch.long), torch.tensor([0, 1]))
+        loader = torch.utils.data.DataLoader(tensors, batch_size=2)
+        data = SimpleNamespace(n_base=2, labeled_dataset=tensors, validation_dataset=tensors,
+                               labeled_loader=loader, semi_loader=loader, validation_loader=loader)
+        cfg = experiment_config(build_parser().parse_args(['--no-llm']))
+        cfg.update(pretrain_epochs=8, patience=2, labeled_batch_size=2)
+        def update(model, *args):
+            with torch.no_grad():
+                model.weight.add_(1)
+        with tempfile.TemporaryDirectory() as directory:
+            trainer = MRETrainer(cfg, data, None, directory)
+            with patch('mre_trainer.BertForModel', Toy), patch.object(trainer, '_step', update), \
+                    patch('mre_trainer.optimizer_for', return_value=(None, None)), \
+                    patch('mre_trainer.mask_tokens', side_effect=lambda ids, *a, **k: (ids, torch.full_like(ids, -100))):
+                model = trainer.pretrain()
+            self.assertEqual(trainer.pretrain_best_epoch, 1)
+            self.assertEqual(len(trainer.history), 3)
+            self.assertEqual(model.weight.item(), 1.)
+            self.assertEqual([r['validation_classifier_accuracy_percent'] for r in trainer.history], [50., 50., 50.])
+
+    def test_real_tiny_bert_last_checkpoint_rtr_and_test_reclustering(self):
         torch.set_num_threads(1)
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -119,15 +178,24 @@ class TrainingIntegrationTests(unittest.TestCase):
             # Fail the test if either new HTTP transport or a legacy call is attempted.
             with patch('requests.post', side_effect=AssertionError('Network forbidden')):
                 result = trainer.train()
-                self.assertTrue((run_dir / 'best_model.pt').is_file())
+                self.assertTrue((run_dir / 'last_model.pt').is_file())
+                self.assertFalse((run_dir / 'best_model.pt').exists())
                 self.assertEqual(result['n_test'], 20)
                 self.assertEqual(result['model'], None)
-                self.assertIsNone(trainer.history[-1]['validation']['Novel'])
-                self.assertNotIn('test', trainer.history[-1])
-                with patch('mre_trainer.KMeans.fit', side_effect=AssertionError('Evaluation must not fit')):
-                    metrics, predictions = score_loader(trainer.model, data.test_loader, trainer.centers,
-                                                         trainer.device, data.n_base, data.n_total)
+                loops = [record for record in trainer.history if record['stage'] == 'loop']
+                self.assertEqual([row['epoch'] for row in loops], [1, 2])
+                self.assertTrue(all('validation' not in row for row in loops))
+                self.assertEqual(result['checkpoint_selection'], 'last_epoch')
+                self.assertEqual(result['checkpoint_epoch'], 2)
+                checkpoint = torch.load(run_dir / 'last_model.pt', map_location='cpu')
+                self.assertEqual(checkpoint['epoch'], 2)
+                for key, tensor in trainer.model.state_dict().items():
+                    torch.testing.assert_close(tensor.cpu(), checkpoint['model_state'][key])
+                metrics, predictions, _ = cluster_score_loader(trainer.model, data.test_loader,
+                    trainer.device, data.n_base, data.n_total, config['seed'], config['kmeans_n_init'])
+                with patch('mre_trainer.cluster_score_loader', wraps=cluster_score_loader) as recluster:
                     evaluate_saved_run(run_dir)
+                    self.assertEqual(recluster.call_count, 1)
                 self.assertEqual(metrics, {key: result[key] for key in ('Base', 'Novel', 'Overall')})
                 replay = json.loads((run_dir / 'reevaluation.json').read_text())
                 self.assertTrue(replay['predictions_identical'])
@@ -135,18 +203,17 @@ class TrainingIntegrationTests(unittest.TestCase):
             self.assertEqual([r['prediction'] for r in stored], predictions.tolist())
             self.assertEqual(metrics, mre_accuracy([r['label'] for r in stored],
                                                    [r['prediction'] for r in stored], 2, 3))
-            # Every model-selection record contains base validation, never a novel score.
-            self.assertTrue(all(entry['validation']['Novel'] is None for entry in trainer.history))
+            self.assertEqual([r['epoch'] for r in trainer.history if r['stage'] == 'intermediate_test'], [1])
             stored[0]['label'] = (stored[0]['label'] + 1) % data.n_total
             (run_dir / 'predictions.jsonl').write_text('\n'.join(json.dumps(row) for row in stored))
             with self.assertRaisesRegex(ValueError, 'sample IDs/labels differ'):
                 evaluate_saved_run(run_dir)
 
-    def test_llm_pairs_receive_text_only_no_self_and_cache_per_graph(self):
+    def test_llm_pairs_decode_tokens_allow_self_and_cache_per_graph(self):
         class Data:
             semi_records = [{'id': str(i), 'text': 'Head A Tail B sentence {}'.format(i)} for i in range(3)]
             semi_dataset = torch.utils.data.TensorDataset(
-                torch.ones(3, 2, dtype=torch.long), torch.ones(3, 2, dtype=torch.long),
+                torch.arange(3).view(3, 1).expand(3, 2), torch.ones(3, 2, dtype=torch.long),
                 torch.zeros(3, 2, dtype=torch.long), torch.tensor([0, -1, -1]))
 
         class Client:
@@ -155,15 +222,21 @@ class TrainingIntegrationTests(unittest.TestCase):
                 self.calls.append((query, choices))
                 return 1
 
+        class Tokenizer:
+            def decode(self, ids, **kwargs):
+                return 'decoded-{}'.format(int(ids[0]))
+
         with tempfile.TemporaryDirectory() as directory:
             client = Client()
             pairs = NeighborPairs(Data(), np.array([[0, 1, 2], [1, 0, 2], [2, 0, 1]]),
-                                  [0], np.array([0, 0, 1]), client, 0, Path(directory) / 'queries.jsonl')
-            first, second = pairs[0], pairs[0]
+                                  [0], np.array([0, 0, 1]), client, Tokenizer(), Path(directory) / 'queries.jsonl')
+            with patch('numpy.random.choice', side_effect=lambda values, size: values[:size]) as draw:
+                first, second = pairs[0], pairs[0]
+                self.assertEqual(draw.call_count, 4)  # q1/q2 consumed even for saved decisions
             self.assertEqual(len(client.calls), 1)
             query, choices = client.calls[0]
-            self.assertNotIn(query, choices)
-            self.assertEqual(choices, [Data.semi_records[1]['text'], Data.semi_records[2]['text']])
+            self.assertIn(query, choices)
+            self.assertEqual(choices, ['decoded-0', 'decoded-2'])
             torch.testing.assert_close(first['neighbor'][0], second['neighbor'][0])
 
 

@@ -4,45 +4,8 @@ import hashlib
 import json
 from pathlib import Path
 
-import numpy as np
 import torch
-from torch.utils.data import DataLoader, Sampler, TensorDataset
-
-
-def balanced_sample_indices(labels, num_samples, rng):
-    """Cycle shuffled classes and sample a member of each with replacement.
-
-    This follows MRE's balanced labeled sampling: large classes do not get
-    proportionally more updates. ``rng`` is owned by the sampler so sampling
-    does not alter the global training or dataset-split random state.
-    """
-    labels = np.asarray(labels, dtype=np.int64)
-    if labels.ndim != 1 or not labels.size:
-        raise ValueError("balanced sampling requires a nonempty label vector")
-    if isinstance(num_samples, bool) or not isinstance(num_samples, int) or num_samples < 1:
-        raise ValueError("num_samples must be a positive integer")
-    members = {int(label): np.flatnonzero(labels == label) for label in np.unique(labels)}
-    classes = np.array(sorted(members), dtype=np.int64)
-    result = []
-    while len(result) < num_samples:
-        rng.shuffle(classes)
-        for label in classes:
-            result.append(int(rng.choice(members[int(label)])))
-            if len(result) == num_samples:
-                break
-    return result
-
-
-class BalancedClassSampler(Sampler):
-    def __init__(self, labels, seed=0):
-        self.labels = np.asarray(labels, dtype=np.int64)
-        self.rng = np.random.RandomState(seed)
-
-    def __iter__(self):
-        return iter(balanced_sample_indices(self.labels, len(self.labels), self.rng))
-
-    def __len__(self):
-        return len(self.labels)
+from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, TensorDataset
 
 
 def _read_split(directory, manifest, split, labeled, n_classes):
@@ -108,7 +71,7 @@ class MREData:
     """
 
     def __init__(self, prepared_dir, tokenizer, max_length=128,
-                 labeled_batch_size=16, train_batch_size=24, eval_batch_size=32, seed=0):
+                 labeled_batch_size=64, train_batch_size=128, eval_batch_size=64, seed=0):
         self.prepared_dir = Path(prepared_dir)
         for name, value in (("max_length", max_length), ("labeled_batch_size", labeled_batch_size),
                             ("train_batch_size", train_batch_size), ("eval_batch_size", eval_batch_size)):
@@ -158,17 +121,19 @@ class MREData:
         ])
         self.labeled_loader = DataLoader(
             self.labeled_dataset, batch_size=labeled_batch_size,
-            sampler=BalancedClassSampler(self.labeled_dataset.tensors[3].tolist(), seed),
+            sampler=RandomSampler(self.labeled_dataset),
             num_workers=0, drop_last=False,
         )
-        generator = torch.Generator().manual_seed(seed)
         self.unlabeled_loader = DataLoader(
-            self.unlabeled_dataset, batch_size=train_batch_size, shuffle=True,
-            generator=generator, num_workers=0, drop_last=False,
+            self.unlabeled_dataset, batch_size=train_batch_size,
+            sampler=RandomSampler(self.unlabeled_dataset), num_workers=0, drop_last=False,
         )
         self.validation_loader = DataLoader(self.validation_dataset, batch_size=eval_batch_size,
-                                            shuffle=False, num_workers=0, drop_last=False)
+                                            sampler=SequentialSampler(self.validation_dataset),
+                                            num_workers=0, drop_last=False)
         self.test_loader = DataLoader(self.test_dataset, batch_size=eval_batch_size,
-                                      shuffle=False, num_workers=0, drop_last=False)
-        self.semi_loader = DataLoader(self.semi_dataset, batch_size=eval_batch_size,
-                                      shuffle=False, num_workers=0, drop_last=False)
+                                      sampler=SequentialSampler(self.test_dataset),
+                                      num_workers=0, drop_last=False)
+        self.semi_loader = DataLoader(self.semi_dataset, batch_size=train_batch_size,
+                                      sampler=SequentialSampler(self.semi_dataset),
+                                      num_workers=0, drop_last=False)

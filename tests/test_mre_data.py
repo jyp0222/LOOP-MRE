@@ -2,11 +2,11 @@ import hashlib
 import json
 from collections import Counter
 
-import numpy as np
 import pytest
 import torch
+from torch.utils.data import RandomSampler, SequentialSampler
 
-from mre_data import BalancedClassSampler, MREData, balanced_sample_indices
+from mre_data import MREData
 from mre_protocol import prepare_dataset
 
 
@@ -96,19 +96,37 @@ def test_missing_token_type_ids_get_zeros(prepared):
     assert not data.semi_dataset.tensors[2].any()
 
 
-def test_balanced_sampling_equal_class_frequency_reproducible_and_advances():
-    labels = [0] * 20 + [1] + [2] * 2
-    first = BalancedClassSampler(labels, seed=11)
-    second = BalancedClassSampler(labels, seed=11)
-    epoch_1, epoch_2 = list(first), list(first)
-    assert epoch_1 == list(second)
-    assert epoch_2 == list(second)
+def test_original_random_sampling_uses_global_torch_rng_without_class_balancing(prepared):
+    data = MREData(prepared, FakeTokenizer())
+    labels = data.labeled_dataset.tensors[3].tolist()
+    sampler = data.labeled_loader.sampler
+    assert isinstance(sampler, RandomSampler)
+    assert sampler.generator is None and not sampler.replacement
+    assert data.labeled_loader.generator is None
+    assert isinstance(data.unlabeled_loader.sampler, RandomSampler)
+    assert data.unlabeled_loader.sampler.generator is None
+    assert data.unlabeled_loader.generator is None
+    torch.manual_seed(11)
+    epoch_1, epoch_2 = list(sampler), list(sampler)
+    torch.manual_seed(11)
+    assert epoch_1 == list(sampler)
+    assert epoch_2 == list(sampler)
     assert epoch_1 != epoch_2
-    counts = Counter(labels[index] for index in epoch_1)
-    assert max(counts.values()) - min(counts.values()) <= 1
-    assert epoch_1.count(20) >= 7  # minority class sampled with replacement
-    with pytest.raises(ValueError, match="nonempty"):
-        balanced_sample_indices([], 1, np.random.RandomState(0))
+    assert sorted(epoch_1) == list(range(len(labels)))
+    assert Counter(labels[index] for index in epoch_1) == Counter(labels)
+    assert len(set(Counter(labels).values())) > 1
+
+
+def test_original_loader_batch_sizes_and_sequential_semi_pool(prepared):
+    data = MREData(prepared, FakeTokenizer())
+    assert data.labeled_loader.batch_size == 64
+    assert data.unlabeled_loader.batch_size == 128
+    assert data.validation_loader.batch_size == data.test_loader.batch_size == 64
+    assert data.semi_loader.batch_size == 128
+    assert isinstance(data.semi_loader.sampler, SequentialSampler)
+    configured = MREData(prepared, FakeTokenizer(), train_batch_size=5, eval_batch_size=7)
+    assert configured.semi_loader.batch_size == 5
+    assert configured.validation_loader.batch_size == 7
 
 
 def test_accidental_true_labels_in_unlabeled_file_rejected(prepared):

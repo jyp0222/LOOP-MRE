@@ -14,12 +14,15 @@ def experiment_config(args):
     names = ('seed', 'position_format', 'pretrain_epochs', 'train_epochs', 'patience',
              'labeled_batch_size', 'train_batch_size', 'eval_batch_size', 'max_length',
              'lr_pretrain', 'lr', 'warmup_proportion', 'grad_clip', 'temperature',
-             'ce_weight', 'topk', 'update_every', 'query_pool_size', 'kmeans_n_init', 'name_clusters')
+             'ce_weight', 'topk', 'update_every', 'query_pool_size', 'kmeans_n_init', 'name_clusters',
+             'view_strategy', 'rtr_prob', 'experiment_variant')
     config = {name: getattr(defaults, name.upper()) for name in names}
     config.update(seed=args.seed, source_dir=str(args.source_dir), bert_model=str(args.bert_model),
                   tokenizer=str(args.tokenizer), llm_enabled=not args.no_llm,
                   model=args.model, reasoning_effort=args.reasoning_effort,
                   api_base=defaults.API_BASE, max_output_tokens=defaults.MAX_OUTPUT_TOKENS,
+                  naming_model=defaults.NAMING_MODEL_NAME, llm_snapshot_verified=False,
+                  checkpoint_selection='last_epoch', evaluation='test_kmeans',
                   request_timeout=defaults.REQUEST_TIMEOUT, max_retries=defaults.MAX_RETRIES,
                   max_requests=args.max_requests, max_queries_per_refresh=None)
     if args.smoke:
@@ -28,6 +31,10 @@ def experiment_config(args):
         config.update(pretrain_epochs=2, train_epochs=2, max_queries_per_refresh=5, name_clusters=False)
     if args.name_clusters:
         config['name_clusters'] = True
+    if args.no_name_clusters or args.no_llm:
+        config['name_clusters'] = False
+    if config['view_strategy'] not in ('rtr', 'none') or not 0 <= config['rtr_prob'] <= 1:
+        raise ValueError('Invalid view augmentation settings')
     for name in ('pretrain_epochs', 'train_epochs', 'patience', 'labeled_batch_size',
                  'train_batch_size', 'eval_batch_size', 'max_length', 'topk', 'update_every', 'kmeans_n_init'):
         if type(config[name]) is not int or config[name] < 1:
@@ -50,7 +57,7 @@ def build_parser():
     parser.add_argument('--tokenizer', type=Path, default=defaults.TOKENIZER)
     parser.add_argument('--output-root', type=Path, default=defaults.OUTPUT_ROOT)
     parser.add_argument('--seed', type=int, default=defaults.SEED)
-    parser.add_argument('--model', choices=['gpt-3.5-turbo', 'gpt-3.5-turbo-0125', 'gpt-3.5-turbo-1106'],
+    parser.add_argument('--model', choices=['gpt-3.5-turbo-0301', 'gpt-3.5-turbo', 'gpt-3.5-turbo-0125', 'gpt-3.5-turbo-1106'],
                         default=defaults.MODEL_NAME)
     parser.add_argument('--reasoning-effort', choices=['none'], default=defaults.REASONING_EFFORT,
                         help='legacy compatibility only; GPT-3.5 has no reasoning mode')
@@ -59,18 +66,20 @@ def build_parser():
     parser.add_argument('--no-llm', action='store_true', help='same-protocol baseline, zero API calls')
     parser.add_argument('--smoke', action='store_true', help='2+2 epochs; at most 5 queried anchors per refresh')
     parser.add_argument('--name-clusters', action='store_true', help='extra paid naming calls after final metrics')
+    parser.add_argument('--no-name-clusters', action='store_true', help='skip the optional post-test naming calls')
     mode = parser.add_mutually_exclusive_group()
     mode.add_argument('--prepare-only', action='store_true', help='parse/audit/split only, no BERT or API')
     mode.add_argument('--check-data', action='store_true', help='also tokenize and check tensor shapes, no API')
     mode.add_argument('--check-llm', action='store_true', help='one small API query, no data/model training')
-    mode.add_argument('--evaluate-run', type=Path, help='reevaluate saved weights and centers, no API or refitting')
+    mode.add_argument('--evaluate-run', type=Path, help='reevaluate a saved run using its recorded evaluation protocol; no API')
     return parser
 
 
 def create_client(args, run_dir=None):
     from llm_client import LLMClient
     return LLMClient(
-        model=args.model, reasoning_effort=args.reasoning_effort, api_key_file=args.api_key_file,
+        model=args.model, naming_model=defaults.NAMING_MODEL_NAME,
+        reasoning_effort=args.reasoning_effort, api_key_file=args.api_key_file,
         base_url=defaults.API_BASE, max_output_tokens=defaults.MAX_OUTPUT_TOKENS,
         timeout=defaults.REQUEST_TIMEOUT, max_retries=defaults.MAX_RETRIES,
         max_requests=args.max_requests,
@@ -82,7 +91,7 @@ def create_client(args, run_dir=None):
 def runtime_info():
     from importlib import metadata
     versions = {}
-    for package in ('torch', 'transformers', 'numpy', 'scipy', 'scikit-learn', 'requests'):
+    for package in ('torch', 'transformers', 'numpy', 'scipy', 'scikit-learn', 'requests', 'faiss-cpu', 'faiss-gpu'):
         try:
             versions[package] = metadata.version(package)
         except metadata.PackageNotFoundError:
@@ -113,8 +122,7 @@ def load_data(config, run_dir, tokenizer_path=None):
     data = MREData(run_dir / 'data', tokenizer, max_length=config['max_length'],
                    labeled_batch_size=config['labeled_batch_size'], train_batch_size=config['train_batch_size'],
                    eval_batch_size=config['eval_batch_size'], seed=config['seed'])
-    # Report differing input visibility: GPT sees complete text; BERT has a
-    # fixed token budget. No silent claim that all entity context survived.
+    # Both BERT and GPT now use the tokenizer-visible, truncated input.
     truncation = {}
     for name, rows in (('train_labeled', data.labeled_records), ('train_unlabeled', data.unlabeled_records),
                        ('validation', data.validation_records)):
@@ -130,15 +138,20 @@ def evaluate_saved_run(run_dir):
     import numpy as np
     import torch
     from model import CLBert
-    from mre_trainer import score_loader, write_json
+    from mre_trainer import cluster_score_loader, score_loader, write_json
     config = json.loads((run_dir / 'config.json').read_text(encoding='utf-8'))
     _, data = load_data(config, run_dir, run_dir / 'tokenizer')
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     model = CLBert(str(run_dir / 'backbone'), device, data.n_base).to(device)
-    checkpoint = torch.load(run_dir / 'best_model.pt', map_location='cpu')
+    original = config.get('evaluation') == 'test_kmeans'
+    checkpoint = torch.load(run_dir / ('last_model.pt' if original else 'best_model.pt'), map_location='cpu')
     model.load_state_dict(checkpoint['model_state'])
-    metrics, predictions = score_loader(model, data.test_loader, checkpoint['centers'].numpy(), device,
-                                        data.n_base, data.n_total)
+    if original:
+        metrics, predictions, _ = cluster_score_loader(model, data.test_loader, device,
+            data.n_base, data.n_total, config['seed'], config['kmeans_n_init'])
+    else:
+        metrics, predictions = score_loader(model, data.test_loader, checkpoint['centers'].numpy(), device,
+                                            data.n_base, data.n_total)
     saved_rows = [json.loads(line) for line in
                   (run_dir / 'predictions.jsonl').read_text(encoding='utf-8').splitlines() if line.strip()]
     if ([(row['id'], row['label']) for row in saved_rows]
@@ -155,6 +168,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.no_llm and args.check_llm:
         parser.error('--no-llm cannot be combined with --check-llm')
+    if args.name_clusters and args.no_name_clusters:
+        parser.error('--name-clusters and --no-name-clusters are mutually exclusive')
     if args.evaluate_run:
         evaluate_saved_run(args.evaluate_run.resolve())
         return
@@ -164,19 +179,25 @@ def main(argv=None):
             'Head: Alice. Tail: Paris. Sentence: Alice was born in Paris.',
             ['Head: Bob. Tail: Rome. Sentence: Bob was born in Rome.',
              'Head: Carol. Tail: London. Sentence: Carol works in London.'])
+        if client.last_query_fallback:
+            raise RuntimeError('API check failed: Choice 1 was only the upstream error fallback; no valid LLM answer')
         print('Requested model: {}; response model: {}; answer: Choice {}'.format(
             client.model, client.last_response_model, answer + 1))
+        print('Provider snapshot provenance: UNVERIFIED (model field is not proof of original 0301 weights).')
         return
     config = experiment_config(args)
     from mre_protocol import prepare_dataset
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-    run_dir = args.output_root.resolve() / 'mre_seed{}_{}'.format(config['seed'], stamp)
+    run_dir = args.output_root.resolve() / 'loop_original_mre_seed{}_{}'.format(config['seed'], stamp)
     # prepare_dataset creates this unique run's immutable data directory.
     manifest = prepare_dataset(args.source_dir, run_dir / 'data', config['seed'], config['position_format'])
     print('Run directory: {}'.format(run_dir), flush=True)
     print('Fixed classes: {} base / {} novel'.format(manifest['n_base'], manifest['n_novel']))
     print('Split counts: {}'.format({name: split['count'] for name, split in manifest['splits'].items()}))
     print('Data audit: {}'.format(manifest['audit']), flush=True)
+    print('Experiment variant: {}; k={}; batch={}/{}/{}; view={}; last-epoch selection; test KMeans'.format(
+        config['experiment_variant'], config['topk'], config['labeled_batch_size'],
+        config['train_batch_size'], config['eval_batch_size'], config['view_strategy']), flush=True)
     client = None
     if not (args.no_llm or args.prepare_only or args.check_data):
         client = create_client(args, run_dir)
@@ -201,11 +222,18 @@ def main(argv=None):
         if args.smoke and client and client.requests_made == 0 and client.cache_hits == 0:
             print('Smoke coverage incomplete: training finished, but no LLM neighbor query was exercised.',
                   flush=True)
+        if client and client.fallback_count:
+            print('LLM fallback warning: {} queries used upstream Choice 1 fallback; inspect llm_calls.jsonl.'.format(
+                client.fallback_count), flush=True)
     finally:
         if client:
             (run_dir / 'llm_summary.json').write_text(json.dumps({
                 'http_attempts': client.requests_made, 'cache_hits': client.cache_hits,
                 'requested_model': client.model, 'reasoning_effort': client.reasoning_effort,
+                'naming_model': client.naming_model, 'fallback_count': client.fallback_count,
+                'response_models': sorted(client.response_models),
+                'model_mismatch_count': client.model_mismatch_count,
+                'snapshot_verified': False,
             }, indent=2) + '\n', encoding='utf-8')
     print('Finished! {}'.format(run_dir), flush=True)
 

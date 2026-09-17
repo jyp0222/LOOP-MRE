@@ -16,20 +16,18 @@ def test_smoke_keeps_normal_ranking_pool_and_bounds_queries(monkeypatch):
     features = np.random.RandomState(7).normal(size=(64, 8))
     centers = features[::8]
     pseudo = predict_clusters(features, centers)
-    indices, old_selected = mine_neighbors(features, pseudo, centers, 10, 5)
-    assert old_selected == []
     indices, normal_selected = mine_neighbors(features, pseudo, centers, 10, cfg['query_pool_size'])
     selected = cap_query_candidates(indices, pseudo, normal_selected, cfg['max_queries_per_refresh'])
     assert len(selected) == 5 and set(selected).issubset(normal_selected)
     for i in selected:
-        assert len(set(pseudo[indices[i][indices[i] != i]])) >= 2
+        assert len(set(pseudo[indices[i]])) >= 2
 
 
-def test_cap_skips_unqueryable_anchor_and_does_not_count_self_as_candidate():
+def test_cap_uses_full_upstream_row_including_self():
     indices = np.array([[0, 1, 2], [1, 2, 3], [2, 1, 3], [3, 1, 2]])
     pseudo = np.array([0, 1, 1, 2])
-    # Anchor 0 only has class-1 neighbors; its own class must not make it eligible.
-    assert cap_query_candidates(indices, pseudo, [0, 2, 1, 3], 1) == [2]
+    # Self remains eligible, just as it does in the original candidate builder.
+    assert cap_query_candidates(indices, pseudo, [0, 2, 1, 3], 1) == [0]
     assert cap_query_candidates(indices, pseudo, [], 5) == []
     assert cap_query_candidates(indices, np.zeros(4), [0, 1, 2], 5) == []
     assert cap_query_candidates(indices, pseudo, [0, 1, 2], 0) == []

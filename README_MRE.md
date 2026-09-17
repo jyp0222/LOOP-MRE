@@ -1,16 +1,14 @@
-# 在 LOOP 上运行 MRE 文本实验：固定 64 个 base / 16 个 novel
+# MRE 文本数据上的原 LOOP baseline
 
-本分支把 **LOOP 的训练方法**接入已确认的 **MRE 样本划分和评估协议**：只使用句子及有方向的实体对，不读取图片；类别固定为原始 `train.txt` 的 64 类和原始 `test.txt` 的 16 类。入口是 `run_mre.py`，服务器路径和默认参数写在 `mre_config.py`。
+本分支按确认的实验要求，恢复原 LOOP 的采样、超参数、模型选择、邻居构造和 GPT 提示词；保留 **MRE 固定 64 个 base / 16 个 novel、MRE 样本协议和 MRE 评估指标**。只使用文本与有方向的实体对，不读取图片。
 
-这是“LOOP 方法在 MRE 协议下的文本实验”，不是复现 MRE 的多模态模型，也不是沿用先前 `mre_64_16/train.tsv` 的实验。原始 LOOP 的说明和入口仍保留在 [README.md](README.md)。
+入口为 `run_mre.py`，服务器路径与参数集中在 `mre_config.py`，不需要 export。当前实验标识为 `loop_original_mre_v1`，输出目录以 `loop_original_mre_seed...` 开头。此前六组采用验证集选 LOOP 模型的结果属于旧设置，不能混入本轮 baseline 的均值。
 
-## 1. 本次采用的实验协议
+## 1. 保留的 MRE 协议
 
-### 类别与样本划分
+类别分别来自原始 `train.txt` 的 64 类和 `test.txt` 的 16 类，按首次出现顺序记录到 manifest；标签编号分别为 0–63 和 64–79，不重新随机选已知类。
 
-类别名单从两个原始文件分别提取，按各文件中关系首次出现的顺序固定到 `manifest.json`；base 的全局标签为 `0..63`，novel 为 `64..79`。代码检查类别数及两组类别不相交，不再随机选择已知类。
-
-对每一个含有 `n` 条记录的 base 类，按下式划分：
+对每个有 n 条记录的 base 类：
 
 ```python
 n_train_val = int(n * 0.5)
@@ -19,227 +17,180 @@ n_validation = n_train_val - n_labeled
 n_test = n - n_train_val
 ```
 
-因此比例约为 **40% 有标签训练、10% 验证、50% 测试**；小类别的实际比例由整数取整决定，不能直接按总样本数乘比例。每个 base 类的三个子集必须非空，不满足时会报错。所有 novel 记录进入测试池。
+约为 **40% 有标签训练、10% 验证、50% 测试**，小类别因取整而不同。所有 novel 样本进入测试池。测试池文本同时作为无标签训练数据；这是传导式（transductive）协议。无标签训练 tensor 中真实标签统一替换为 -1，GPT 不接收真实关系名。
 
-| 数据部分 | 用途 | 训练时能否读取真实标签 |
-| --- | --- | --- |
-| base 的有标签训练部分 | CE 监督及联合训练 | 能 |
-| base 的验证部分 | 选择 checkpoint、早停 | 不进入训练 loss，仅用于验证 |
-| base 的测试部分 + 全部 novel | 无标签训练，同时用于最后测试 | 无标签训练 tensor 中统一为 `-1` |
-
-**这是一种传导式（transductive）实验**：待评估的测试文本在训练时可见，但测试真实标签不能用于训练、选邻居、问 GPT 或选 checkpoint。这正是本次确认的 MRE 样本协议。测试与无标签文件的样本 ID、文本及顺序必须相同；验证样本 ID 必须与训练/测试分离。
-
-不存在额外的 `labeled_ratio=0.1` 抽样。划出来的 base 有标签训练记录全部可用于监督。此前使用 211 条有标签记录、481 条测试记录等划分得到的数字，不能直接与本分支的新结果比较。
-
-### 数据处理与审计
-
-- 原始文件支持每行 JSON 或 Python 字典文本；使用安全的 `ast.literal_eval` 解析后者，不使用 `eval`。
-- 输入可以使用 `tokens` 或 `token`；若两者同时存在但内容不同则报错。实体 `h`、`t` 的方向保留为 `Head → Tail`。
-- 空字符串和仅含空白的 token 可正常处理：先按原始 token 索引定位实体、插入标记，再在输出句子中省略空白内容，不删除原始记录、不改变实体索引。manifest 审计记录空白 token 的数量和行号/位置示例。非字符串 token、全空白句子或全空白实体范围仍会报具体位置，避免把损坏输入悄悄当作正常文本。
-- 默认 `POSITION_FORMAT = 'indices'`，例如 `[13, 14]` 表示两个连续 token，`[13]` 表示一个 token。只有数据确实采用半开区间时才改为 `'half_open'`；代码不会根据数组长度猜测。
-- 仅过滤关系名 `Other`、`None`、`none`、`NA`；不会加载或检查图片文件。
-- **重复记录和同输入多标签记录保留并报告，不自动去重、不自动删除歧义数据。** 不同原始行可能具有同样文本，因此仍可能出现跨子集的文本重复；相关计数记录在 manifest 的 `audit` 中，汇报实验时应披露。
-- 保存原文件 SHA-256、样本 ID、类别顺序、种子、各类计数以及生成文件的 SHA-256。加载时检查文件与清单一致。
-
-每次运行都创建独立输出目录及独立的数据快照，不覆盖之前的实验。
-
-## 2. 评估究竟改了什么
-
-`mre_metrics.py` 对预测 cluster ID 与真实类别构建一个 `80 × 80` 计数矩阵，**只进行一次全局匈牙利匹配**，再基于该映射计算：
-
-- `Base`：真实类别属于 base 的样本准确率。
-- `Novel`：真实类别属于 novel 的样本准确率。
-- `Overall`：所有测试样本的准确率。
-
-三项均为按样本计数的准确率，输出范围 `0..1`，不提前四舍五入；例如 `0.46` 对应 `46%`。不能给 base 和 novel 分别做一次匹配，也不能把 Overall 直接算为 `(Base + Novel) / 2`。验证集没有 novel，故验证输出的 `Novel` 是 `null`。
-
-**MRE 和原 LOOP 的这些准确率具有相同的基本全局匹配思想。** 本次不能声称“换指标公式就能提高分数”。实际需要统一的是数据、类别、推理和 checkpoint 选择口径：
-
-1. 预训练和 LOOP 训练都以 base 验证准确率选择模型；相同分数保留较后的 checkpoint，连续 `PATIENCE` 轮未达到当前最佳则早停。
-2. LOOP 阶段仅在训练池特征（有标签训练 + 无标签池）上拟合 80 个聚类中心。每轮验证前，用当前权重重新拟合训练池中心，并将最佳模型权重与其中心一起保存。
-3. 验证和最终测试都只做“提取特征 → 最近中心预测 → MRE 匹配计分”，**不会在 `score_loader` 中重新拟合验证集或测试集的 KMeans**。由于实验本身是传导式，训练池原本包含测试文本；这不等于测试时另行重聚类。
-4. 训练结束恢复验证选出的权重和中心，只进行最后一次测试汇报，不用中途测试成绩选最佳轮数。
-
-这里沿用的是 MRE 的评估和选择协议；LOOP 的预测器仍是特征聚类中心，并没有被替换为 MRE 模型的参数化分类头。匈牙利映射只用于计分，不反馈到训练。
-
-## 3. 保留的 LOOP 方法与必要调整
-
-主干继续使用原 `model.py` 的 BERT 和投影头、`utils/contrastive.py` 的对比损失：BERT CLS 特征为 768 维，投影后的对比特征为 128 维，监督分类覆盖 64 个 base 类，聚类覆盖全部 80 类。
-
-```text
-有标签 base + 无标签文本
-  → 预训练：CE + MLM
-  → CLS 特征、训练池聚类、近邻图
-  → 按熵与邻域不一致性筛选候选样本
-  → GPT 比较有方向的实体关系，选择较相近的候选
-  → LOOP 训练：0.5 × CE + RNCL
-  → base 验证选择“权重 + 中心”
-  → 固定中心预测，输出 MRE Base / Novel / Overall
-```
-
-GPT 只接收 `Head / Tail / Sentence` 和候选文本，不接收真实关系名或标签。返回严格 JSON 的零起始候选索引；API 报错、拒答、输出不完整或索引非法都会停止，不随机补答案或偷偷换模型。
-
-为使新协议可运行且可审计，以下实现差异需要在报告中说明：
-
-| 部分 | 本分支的处理 |
+| 数据 | 本次用途 |
 | --- | --- |
-| 有标签采样 | 按 MRE 使用类别均衡采样：打乱类别顺序循环，从当前类内有放回抽样 |
-| 输入视图 | 沿用之前文本实验的无额外增强设置；不加入图片、实体视觉特征或新损失 |
-| 优化器 | 使用 PyTorch AdamW，`eps=1e-6` 对齐旧 Transformers AdamW 的默认 epsilon；不承诺跨库逐位相同 |
-| 更新步数 | 使用实际 batch 数，包含最后一个不满 batch |
-| 近邻 | 保留原始内积相似度；分块 NumPy 实现免除新入口对 GPU FAISS 的强制依赖，明确把自身放在近邻列表首位 |
-| GPT 候选 | 排除查询本身，候选来自不同伪类别；未查询样本仍沿用随机近邻行为 |
-| LIS 计算 | 保留原代码实际的 `q ** 2 / 2`、归一化及 `softmax(p)` 熵排序；本次没有悄悄改为另一套论文公式 |
-| 标签边界 | 只有非负真实训练标签能构成监督同类对；所有无标签样本的 `-1` 不会被当成“同一个类” |
-| 文本长度 | BERT 默认截断到 128 token；GPT 接收完整关系文本，二者可见长度不同，截断统计写入 `tokenization_audit.json` |
+| base 有标签训练部分 | 预训练 CE、第二阶段 CE 及有标签同类正例 |
+| base 验证部分 | **仅预训练**的分类准确率选模型与早停 |
+| base 测试部分 + 全部 novel | 无标签训练；中途与最终测试计分 |
+| 图片 | 完全不加载 |
 
-默认超参数来自配置文件：预训练最多 100 轮、LOOP 最多 50 轮、patience 10；batch 为有标签 16、LOOP 24、评估 32；学习率分别 `5e-5` 和 `1e-5`；top-k 为 20，每 5 轮更新近邻；候选池上限为 500。候选池是两种排序的交集，不保证每次发出 500 次请求。这些默认值不代表已经在 MRE 上调优。
+当前原始数据预期得到 1006 条有标签训练、2416 条无标签训练、282 条验证和 2416 条测试；联合训练池为 3422 条。运行输出及 manifest 是实际数量的依据。不存在额外的 `labeled_ratio=0.1` 抽样。
 
-## 4. GPT 模型与 API key
+`mre_protocol.py` 的原有数据策略保持不变：
 
-默认使用 LOOP 论文中的 **GPT-3.5 Turbo 系列**，不再选择 GPT-5.6 或 GPT-6。论文第 4.1.4 节写明使用 GPT-3.5 Turbo API；原代码的邻居查询使用 `gpt-3.5-turbo-0301`，聚类命名使用 `gpt-3.5-turbo`。
+- 支持每行 JSON 或 Python 字典，后者用 `ast.literal_eval`。
+- 默认实体位置格式为 `indices`：`[13, 14]` 表示两个 token，`[13]` 表示一个。先按原索引插入实体标记，再省略输出中的空白 token，防止实体错位。
+- 文本保留 Head → Tail 方向，BERT 与 GPT 均使用这段关系文本；GPT 接收 tokenizer 解码后的实际输入。
+- 过滤 `Other`、`None`、`none`、`NA` 关系。重复及冲突记录保留并报告，不自动清洗。
+- 保存源文件与生成文件的 SHA-256、样本 ID、类别名单、划分种子和审计信息；每次运行使用独立数据快照。
+- 原数据的重复文本可能跨子集；审计中的重复和冲突数量应随实验报告披露。训练不主动使用测试标签。
 
-必须区分模型系列和历史快照：`gpt-3.5-turbo-0301` 已于 2024-09-13 停止服务，见 [OpenAI 停用说明](https://developers.openai.com/api/docs/deprecations)。本项目明确配置官方仍列出的 `gpt-3.5-turbo`，见 [GPT-3.5 Turbo 模型文档](https://developers.openai.com/api/docs/models/gpt-3.5-turbo)。这是同系列复现，不能声称使用了当年的相同快照；客户端拒绝 `0301` 配置，不会自动替换用户指定的模型。账号权限与网络连通性仍由实际请求确认。
+## 2. 对齐了哪些原 LOOP 设置
 
-```python
-# mre_config.py
-MODEL_NAME = 'gpt-3.5-turbo'
-REASONING_EFFORT = None  # 不向 GPT-3.5 发送推理参数
-```
+这里的“原值”以仓库保留的 `init_parameter.py`、`mtp.py`、`loop.py` 和 `utils/` 原实现为准。
 
-GPT-3.5 没有本项目此前 GPT-5/6 的推理档位；`None` 表示该参数不适用。旧命令的 `--reasoning-effort none` 仅兼容解析，不会发送到 API。可显式指定客户端支持的 GPT-3.5 快照，实际可访问性以账号请求为准。`llm_calls.jsonl` 同时记录请求模型和 API 返回的实际模型版本；非 GPT-3.5 响应会被拒绝。
+| 项目 | 本次设置 | 原实现位置 | MRE 入口位置 |
+| --- | --- | --- | --- |
+| 有标签采样 | RandomSampler，普通无放回随机采样；无类别均衡过采样 | dataloader.py | mre_data.py |
+| 预训练有标签 batch | **64** | init_parameter.py | mre_config.py |
+| 第二阶段 / MLM 联合池 batch | **128** | init_parameter.py、dataloader.py | mre_config.py、mre_data.py |
+| 评估 batch | **64** | init_parameter.py | mre_config.py |
+| 邻居 k | **50**；FAISS 请求 k+1 个返回值 | init_parameter.py、utils/memory.py | mre_config.py、mre_neighbors.py |
+| 预训练 | 最多 100 轮；CE + MLM（mask 概率 0.15） | mtp.py | mre_trainer.py: pretrain |
+| 预训练选模型 | 普通分类 ACC（百分数保留两位），严格变好才更新，平分保留较早轮；patience=20 | mtp.py | mre_trainer.py: pretrain |
+| 第二阶段 | **50 轮全部训练完成，使用末轮模型，不用验证集早停** | loop.py: train | mre_trainer.py: train |
+| 第二阶段损失 | 0.5 × CE + RNCL，温度 0.07 | loop.py、utils/contrastive.py | mre_trainer.py、原 model.py |
+| 文本增强 | RTR，替换概率 0.25 | utils/tools.py: view_generator | mre_trainer.py，复用原函数 |
+| 优化器 / LR | Transformers AdamW；预训练 5e-5，第二阶段 1e-5 | mtp.py、loop.py | mre_trainer.py: optimizer_for |
+| 调度器 | warmup 0.1；总步数 floor(N / batch) × epochs；仍训练尾 batch | mtp.py、loop.py | mre_trainer.py |
+| 近邻更新 | 初始及每 5 轮后更新（训练轮次 1、6、11…使用新图） | loop.py | mre_trainer.py |
+| 查询筛选 | 熵前 500 与局部不一致性前 500 的交集，不保证 500 次请求 | utils/memory.py | mre_neighbors.py: mine_neighbors |
+| 最终预测 | 末轮特征，在**测试集上重新拟合 80 类 KMeans** | loop.py: evaluation | mre_trainer.py: cluster_score_loader |
+| 最终指标 | **MRE Base / Novel / Overall** | 本次保留的 MRE 要求 | mre_metrics.py |
 
-客户端通过 `requests` 请求 OpenAI `/v1/chat/completions`，使用 JSON mode（`response_format={"type":"json_object"}`），再在本地校验答案字段与候选编号；不发送 GPT-3.5 不支持的严格 JSON Schema 或推理参数。不依赖新版 OpenAI SDK，无须为此升级服务器已有的 `openai==0.28.0`。配置 `MAX_OUTPUT_TOKENS=4096` 转换为该接口的 `max_tokens`，限制生成答案的 token 数；截断、空回答、拒答和非法 JSON 都不会作为训练监督使用。相对原版 `Choice 1/2` 文本，这里保留当前 MRE 分支的 JSON 答案契约，提示词仍比较有方向的关系。
+KMeans 显式设置 `n_init=10`，对应原仓库指定的 scikit-learn 1.2 默认行为，避免随新版库默认值变化。聚类数固定为 80。模型继续复用原 `model.py`：BERT CLS 768 维，对比投影 128 维，监督分类头 64 类，没有新增网络或损失。
 
-缓存版本和请求端点已经更新，旧 GPT-5/6 回答不会混用。客户端不显式设置采样 temperature，与原 LOOP 调用同样采用 API 默认值；重复请求仍不保证完全确定。模型、token 上限、提示词、候选顺序或文本变化会形成不同缓存键。
+原 LOOP 每 5 轮会报告测试聚类成绩，本入口也恢复这一输出，`history.json` 中标为 `intermediate_test`。**这些成绩不参与早停、选模型或参数更新**；默认正式结果始终来自第 50 轮。不要看到中途更高的测试分数就替换最终结果。
 
-不需要 `export`。默认首次实际请求时隐藏输入 API key。需要非交互运行时，把 key 保存为服务器上仓库之外的私人文本文件，并在配置中指定：
+最终评估采用 MRE 的一次全局匈牙利匹配：在全部测试样本上构造 80×80 的计数矩阵，得到一个统一映射，然后按真实 base/novel 身份分别统计 Base、Novel、Overall。指标输出范围为 0–1；不对 base/novel 各自单独匹配，Overall 也不是二者简单平均。预训练的普通分类 ACC 不使用匈牙利匹配。
 
-```python
-API_KEY_FILE = Path('/home/zhoubaohang/.config/loop-mre/openai_api_key')
-```
+## 3. 邻居与 GPT 如何恢复
 
-该文件仅放一行 key，不要把 key 写进 Python 代码、Git 或实验记录。通过终端编辑文件时可将权限设为 `chmod 600`。显式指定的 key 文件不存在或为空会报错，不会自动换用其他身份。客户端也兼容 `OPENAI_API_KEY`，但这不是必需配置。
+1. 在联合训练池上用当前 CLS 特征聚类，得到伪类别。
+2. 用 FAISS 的原始内积检索 k+1 个结果，不归一化、不强行将自身移动到第一位。
+3. 按原代码计算 q、p 和 `softmax(p)` 熵，局部不一致性计算跳过检索返回的第一个位置，两种前 500 排序取交集。
+4. 从检索顺序中最先出现的两个不同伪类别里分别随机抽取 q1、q2，允许包含查询自身。只出现一个伪类别或未选中的 anchor 随机抽取一个近邻。
+5. 对选中 anchor，GPT 返回 Choice 1 或 Choice 2；同一近邻图内缓存所选邻居，刷新图后重新构造。
+6. 保留原全局 NumPy 随机抽样顺序：即使命中图内保存的决定，也先抽取 q1/q2。
 
-API 请求会按账号实际用量计费。`--max-requests N` 限制的是本次进程的 **HTTP 尝试次数，包含重试**，不是费用上限；缓存命中不消耗该次数。默认只对网络错误、429 或 5xx 做有限重试，401/403 等不会连续重试。缓存与日志不保存 API key 或请求原文，查询记录通过样本 ID 回溯。
+调用恢复为原提示词，包括原文的 **customer utterance / intent**。虽然输入现在是关系文本，本轮 baseline 按要求不改写成关系抽取专用提示词；这是后续可以单独做消融的地方。
 
-## 5. 在服务器上逐步运行
+| 调用位置 | 请求模型 | 返回 |
+| --- | --- | --- |
+| 训练时选邻居 | **gpt-3.5-turbo-0301** | Choice 1 / Choice 2 |
+| 训练后簇命名 | **gpt-3.5-turbo**，原 LOOP 的命名调用使用此别名 | 单词或短语 |
 
-以下命令在服务器已有的 `loop-mre` 环境执行。代码使用 Python 3.8 兼容语法，可沿用原 LOOP 的 torch/Transformers/scikit-learn/scipy/numpy/pandas/tqdm 环境；新 API 客户端还需要 `requests`。不要为了运行新入口直接升级整个旧环境。BERT 权重及 tokenizer 继续使用服务器已验证成功的本地目录。
+原版命名在联合训练池上另做 KMeans，通过有标签类别原型与中心的**欧氏距离**匈牙利匹配找出 novel 簇；每簇取距离中心最近的三条文本查询 GPT。正式运行默认开启；只影响可解释性，不改变已经保存的准确率。无 LLM 对照和 smoke 默认关闭命名。
 
-**第一步：取新分支到独立目录。** 下面使用新的 `LOOP-MRE-mre-protocol` 目录，保留原来的 LOOP 目录和实验输出。
+API 默认只发送 model 和 messages，不发送 JSON mode、reasoning、temperature 或 max_tokens，以恢复原 LOOP 的调用参数。按原代码进行大小写敏感的子串解析：同时出现两种 Choice 时优先 Choice 1。
+
+**0301 后端快照未核实。** 这里恢复的是请求名称；中转站响应里的模型字段也不能证明实际使用了 2023 年的原始权重。请求模型、返回模型及名称不一致会记录到日志，不会偷偷更换请求模型。论文/汇报应写“通过中转站请求 gpt-3.5-turbo-0301，实际快照未核实”。
+
+原代码在请求失败或无法解析时选 q1，本入口恢复该行为，同时发出 warning，记录 `neighbor_fallback`、`fallback_count`，不把失败答案写入持久缓存。已选 q1 仍按原版在本次近邻图内复用。命名失败记录错误。**本地 key 配置错误和请求预算耗尽直接停止**；`--check-llm` 如果只能得到回退答案会报错，不会误报 API 已连通。
+
+## 4. 必须说明的适配边界
+
+本轮对齐的是原 LOOP 的算法与上述设置，并不宣称跨硬件、软件版本和第三方模型逐位复现。
+
+- 数据、类别、样本比例和最终计分改用已确认的 MRE 协议；保留实体方向及标记，max length=128。这是 MRE 输入适配，不是原意图分类数据。
+- 修正原监督邻接中的边界问题：仅真正有标签的非负标签参与同类约束，不让第一条无标签样本被当作有标签数据；不执行原近邻挖掘中不影响返回结果的真实标签匈牙利调用。
+- GPU FAISS 可用时使用 GPU，测试环境可用 CPU FAISS；训练设备目前为单卡 cuda:0（或 CPU），不自动启用原代码的多卡 DataParallel。
+- 极短 batch 没有任何 MLM mask 时令该项为零，避免 NaN；正常 MRE batch 不改变 mask 策略。小于 k+1 的合成测试池会截小 k，正式数据不触发。
+- 保留隔离输出、输入审计、有限超时、key 文件、调用日志和持久响应缓存。持久缓存按端点、模型、提示词、候选顺序和生成参数区分；相同请求复用成功答案，可能减少原代码的重复请求。原模型采样参数保持 API 默认值。
+- 没有恢复 API key 写进代码等做法；不改变原始 MRE 文件，也不覆盖旧实验。
+
+## 5. 服务器操作
+
+使用此前已跑通的 `loop-mre` 环境，先更新已有工作副本：
 
 ```bash
 conda activate loop-mre
-cd /home/zhoubaohang/jiangyipeng
-git clone --branch codex/mre-fixed-protocol --single-branch https://github.com/jyp0222/LOOP-MRE.git LOOP-MRE-mre-protocol
-cd LOOP-MRE-mre-protocol
+cd /home/zhoubaohang/jiangyipeng/LOOP-MRE-mre-protocol
+git status --short
+git -c http.version=HTTP/1.1 pull --rebase --autostash origin codex/mre-fixed-protocol
+git rev-parse --short HEAD
 ```
 
-如果该目录已经存在，请进入对应工作副本后检查分支和本地修改，不要再次覆盖克隆。
+不要使用 `--ff-only --autostash`，该服务器 Git 不支持此组合。若自动恢复本地配置时出现冲突，先处理冲突再运行；旧 outputs 不需要删除。
 
-**第二步：编辑 `mre_config.py`。** 至少确认：
+检查 `mre_config.py` 中这些值，尤其本地旧配置不要盖回旧参数：
 
 ```python
 SOURCE_DIR = Path('/home/zhoubaohang/FewRel')
 BERT_MODEL = Path('/home/zhoubaohang/jiangyipeng/LOOP/pretrained/bert-base-uncased')
 TOKENIZER = BERT_MODEL
-MODEL_NAME = 'gpt-3.5-turbo'
-REASONING_EFFORT = None
+API_BASE = 'https://api.zhizengzeng.com/v1'
+MODEL_NAME = 'gpt-3.5-turbo-0301'
+NAMING_MODEL_NAME = 'gpt-3.5-turbo'
+TOPK = 50
+LABELED_BATCH_SIZE = 64
+TRAIN_BATCH_SIZE = 128
+EVAL_BATCH_SIZE = 64
+VIEW_STRATEGY = 'rtr'
 ```
 
-`SOURCE_DIR` 下应是未经此前转换/重划分的 `train.txt` 和 `test.txt`。不要填入以前的 `data/mre_64_16` TSV 目录。路径也支持通过 `--source-dir`、`--bert-model`、`--tokenizer` 传入；如果改变模型路径而分词器也随之变化，要同步设置分词器路径。
-
-**第三步：先验证数据，不调用 API。**
+源目录应含原始 train.txt/test.txt，不填以前生成的 TSV 目录。保留已有 Python 3.8、PyTorch 1.11、Transformers 4.15、scikit-learn 1.2 等 LOOP 环境，不需要升级 OpenAI SDK；客户端通过 requests 发请求。恢复 FAISS 检索后可先确认原环境中可导入：
 
 ```bash
-python run_mre.py --prepare-only
-python run_mre.py --check-data
+python -c "import faiss; print('FAISS:', faiss.__version__)"
+python -u run_mre.py --check-data
+python -u run_mre.py --check-llm
+python -u run_mre.py --smoke --seed 0 --max-requests 20
 ```
 
-前一条仅解析、划分、审计；后一条还加载本地 tokenizer 并检查 tensor。每条命令都产生自己的输出目录。重点检查固定类别 `64 / 16`、各子集数量、重复/歧义计数和截断比例；不要期待得到旧版 211/2734/262/481 的数量。
+`--check-data` 不训练、不调用 API。`--check-llm` 仅一个小型付费查询。smoke 为预训练 2 轮 + LOOP 2 轮，保留正常前 500 排名交集，再限制最多 5 个可查询 anchor，默认不命名；它的数字不作正式结果。若图没有可查询样本会提示覆盖不足，不强制伪造候选。核对 `llm_summary.json` 中的请求次数与 fallback_count。
 
-**第四步：独立检查 GPT。此命令会发起一个小型付费查询，不训练 BERT。**
+默认首次实际查询时隐藏输入 key。若希望运行不再等待输入，在仓库之外保存仅含一行 key 的私人文件，设权限为 600，然后填写：
+
+```python
+API_KEY_FILE = Path('/home/zhoubaohang/.config/loop-mre/openai_api_key')
+```
+
+不要把 key 放入 Git。可先完成 `--check-llm` 再正式训练。恢复原回退策略后，即使训练最终结束，也需要确认失败回退次数，不能仅凭 Finished 断言所有请求成功。
+
+正式 seed 0 对照：
 
 ```bash
-python run_mre.py --check-llm
+python -u run_mre.py --seed 0 --no-llm
+python -u run_mre.py --seed 0
 ```
 
-应看到请求模型、API 返回的实际模型版本和 `Choice 1` 或 `Choice 2`。如果返回权限或模型错误，先修正 key/账号权限/配置，不要绕过错误继续训练。之前服务器到 `api.openai.com` 的连接超时不会因更换模型自动解决。
+确认正常后，分别将 seed 改为 1、2，按相同设置重做有/无 LLM 的配对实验。正式 LLM 运行默认还会在计分后做 16 个 novel 簇命名请求；可以明确使用 `--no-name-clusters` 省去该解释步骤，其关闭不改变此前的训练和分数。
 
-**第五步：短流程检查。**
+`--max-requests N` 是当前进程的 HTTP 尝试上限（包含失败/显式重试），不是费用上限；达到上限会停止，不把后续候选悄悄改成无 LLM。默认每个请求一次尝试。完整 50 轮实验会更新近邻多次，不要沿用 smoke 的 20 次上限。
 
-```bash
-python run_mre.py --smoke
-```
+## 6. 输出与检查点
 
-默认将预训练与 LOOP 训练各设为 2 轮，保留配置中的正常候选排名池（默认 500），取交集后再选出最多 5 个具有两个不同邻居伪类别的 anchor；默认不生成簇名称。查询上限记入 `config.json` 的 `max_queries_per_refresh`，正式实验为 `null`，保持未截断的原候选筛选。在默认更新频率下，短流程只更新一次近邻，已询问的 anchor 在该轮近邻图内复用答案。
+每次运行的 `config.json` 保存最终有效设置、代码版本/哈希和包版本；以它为准，不能只看当前 Python 配置。
 
-这修复了旧版 smoke 将两个排名都缩为前 5 名、导致交集容易为空的问题。如果正常候选池的交集本身仍为空或没有可比较候选，代码不会强行补充查询；短流程结束时会明确提示 `Smoke coverage incomplete`。应检查 `llm_summary.json` 和 `neighbor_queries.jsonl`，不能仅凭“训练结束”断言训练中一定用了 GPT。HTTP 重试可能使尝试数大于 anchor 数；必要时另加 `--max-requests`。短流程指标只用于确认流程可运行。
-
-**第六步：正式实验与无 LLM 对照。**
-
-```bash
-python run_mre.py --seed 0
-python run_mre.py --seed 1
-python run_mre.py --seed 2
-
-python run_mre.py --no-llm --seed 0
-python run_mre.py --no-llm --seed 1
-python run_mre.py --no-llm --seed 2
-```
-
-`--no-llm` 在同一套 MRE 数据、训练和评估流程下禁用 GPT，保留随机近邻选择，是判断 GPT 是否带来收益的必要对照。GPT-3.5 的有限请求短测试示例：
-
-```bash
-python run_mre.py --model gpt-3.5-turbo --smoke --max-requests 20 --seed 0
-```
-
-此处 `seed` 同时影响样本划分与训练随机性；换 seed 不是仅换模型初始化。应报告三个 seed 各自结果以及均值、标准差，并明确这是跨划分和训练随机性的统计。同 seed 的方法比较还应核对原文件哈希、manifest、参数和库版本；不要仅凭种子数字相同就声称所有随机过程完全配对。
-
-## 6. 输出、复核与后续汇报
-
-每次运行输出到 `outputs/mre_seed<seed>_<时间>/`。不同执行模式只生成相应阶段的文件；完成训练后主要文件如下：
-
-| 文件 | 用途 |
+| 文件 | 内容 |
 | --- | --- |
-| `config.json` | 实验参数、Python/依赖版本、Git commit、本地修改标志、源码与 manifest 哈希 |
-| `data/manifest.json` 及四个 JSONL | 类别、样本划分、数据审计、测试标签与无标签训练文件的明确分离 |
-| `tokenization_audit.json` | BERT 截断数量和原始 token 长度统计 |
-| `history.json` | 预训练/LOOP loss、base 验证成绩及调用计数 |
-| `best_model.pt` | 最佳权重及与其对应的 80 个训练池中心 |
-| `pretrained_backbone/`、`backbone/`、`tokenizer/` | 预训练主干、最终选中主干和分词器 |
-| `results.json`、`results.csv` | 最终 `Base / Novel / Overall`、最佳轮数和实验信息 |
-| `predictions.jsonl` | 每个测试样本 ID、真实标签和预测 cluster ID |
-| `llm_calls.jsonl`、`llm_cache.jsonl` | 请求状态、模型元数据、token 用量及严格校验后的缓存答案 |
-| `neighbor_queries.jsonl`、`llm_summary.json` | 实际询问的样本/候选 ID，以及本次 HTTP 尝试与缓存命中计数 |
+| data/manifest.json | 64/16 类表、样本划分、源文件哈希、重复/歧义审计 |
+| tokenization_audit.json | 截断数量及最大 token 长度 |
+| history.json | 预训练分类 ACC、第二阶段 loss、定期间隔测试与调用计数 |
+| pretrain_selection.json | 预训练所选轮次、分数、完成轮数；平分保留较早轮 |
+| pretrained_backbone/ | 预训练选中模型的 backbone |
+| last_model.pt | 第二阶段末轮完整权重，epoch=50（smoke=2） |
+| backbone/、tokenizer/ | 可重新载入的末轮 backbone 与分词器 |
+| results.json / results.csv | 最终 MRE 指标、实验标识、所用轮次等 |
+| predictions.jsonl | 测试样本 ID、真实 label 和预测 cluster ID |
+| llm_calls.jsonl / llm_summary.json | API 尝试、缓存命中、回退、返回模型及未核实快照声明 |
+| neighbor_queries.jsonl | 候选与所选样本 ID、是否因失败回退 |
+| llm_cache.jsonl | 成功回答的持久缓存；不保存 key 或请求原文 |
+| cluster_names.json | 训练后命名，不参与指标计算 |
 
-没有实际 GPT 查询时，相应逐条日志文件可能不存在。最终评估不依赖生成的簇名称；只有指定 `--name-clusters` 才会额外请求命名并输出 `cluster_names.json`，这部分请求同样收费。
-
-可以从保存的模型与中心重新评估，且不调用 GPT、不重新拟合 KMeans：
-
-```bash
-python run_mre.py --evaluate-run outputs/mre_seed0_替换为实际时间
-```
-
-复核时会验证 config 中保存的 manifest 指纹，以及已保存预测的样本 ID、标签和顺序；不匹配则报错。检查生成的 `reevaluation.json` 中 `predictions_identical` 是否为 `true`。该功能是推理复核，**不是精确断点续训**；当前没有保存完整优化器、调度器、采样器和全部随机状态以恢复中断训练。
-
-对导师建议至少汇报：数据来源与 64/16 名单、传导式协议、各 seed 数据量、重复/歧义和截断审计、LLM 请求型号/API 返回版本/实际请求量、GPT 与无 GPT 的三项指标及均值/标准差。不要将簇名称看起来合理视为分类准确率正确的证据。
-
-## 7. 实现依据与检查
-
-样本协议、均衡采样和评估参考 [MRE_learn 的 `data_loader.py`](https://github.com/jyp0222/MRE_learn/blob/82afbeba49b411b8f0db5bee58f6fd8d87e7ac89/data_loader.py)、[`framework.py`](https://github.com/jyp0222/MRE_learn/blob/82afbeba49b411b8f0db5bee58f6fd8d87e7ac89/framework.py) 和 [`utils.py`](https://github.com/jyp0222/MRE_learn/blob/82afbeba49b411b8f0db5bee58f6fd8d87e7ac89/utils.py)。所核对版本中，MRE 的类别选择曾采用随机切分；本次根据已确认方案明确替换为原文件定义的固定 64/16 类，因此不是不加区分地复制其所有默认值。
-
-上游 LOOP 基线来自 [Lackel/LOOP](https://github.com/Lackel/LOOP) 及本仓库修改前的 commit `7b139f4a5ed41cf52baead68d7a98b88571466ae`。新增入口的核心模块为 `mre_protocol.py`、`mre_data.py`、`mre_neighbors.py`、`mre_trainer.py`、`mre_metrics.py` 和 `llm_client.py`。
-
-自动化测试位于 `tests/`，覆盖数据划分与标签隔离、指标与 MRE 参考实现的一致性、近邻逻辑及模拟 GPT-3.5 Chat Completions 请求；执行时不需要真实 API key：
+对新结果重新评估（不调用 API）：
 
 ```bash
-python -m pytest tests -q
+python -u run_mre.py --evaluate-run outputs/loop_original_mre_seed0_实际时间戳
 ```
 
-自动化检查不能替代服务器真实数据、GPU 训练及账号 API 可用性验证。不要把离线测试通过写成“已经跑出正式实验结果”。
+会载入末轮权重，在测试特征上重做 KMeans，并输出 `predictions_identical`。旧结果目录的 config 若没有 `evaluation=test_kmeans`，仍按旧的 best_model+固定中心方式复查；不会把旧模型自动解释为新 baseline。
 
-初始协议版本的历史验证：103 项离线测试通过（协议 10、指标 6、数据加载 8、客户端 70、近邻/训练/复核 9），并通过 Python 3.8 语法检查。训练集成测试用随机初始化的单层小型 BERT 和合成的 2 base / 1 novel 数据，完成 CE+MLM、CE+RNCL、保存和重新加载，验证预测一致且评估不会调用 KMeans.fit；64/16 类别约束另有协议测试覆盖。当时训练测试环境为 Python 3.9、CPU PyTorch 2.8、Transformers 4.2.1。
+## 7. 离线验证
 
-本次 GPT-3.5 迁移验证：94 项客户端测试和 6 项无 BERT 的入口测试通过，修改文件通过 Python 3.8 语法及 diff 检查。系统 pytest 插件自动加载会干扰本地测试，关闭插件自动发现后通过。本次 BERT 集成测试在收集阶段被本地全局 Transformers 5.2.0 与 Python 3.9 的 `UnionType` 导入不兼容阻塞；没有修改服务器依赖，也没有重新验证 GPU 训练。上述历史训练结果不能代替本次服务器 smoke。本次未使用真实数据训练或发起付费 API 请求。
+`python -m pytest tests -q` 覆盖数据划分与泄漏边界、MRE 全局匹配、随机采样、原源码提示词对照、FAISS/LIS 与原源码对照、API 回退/缓存/预算，以及合成文本和本地生成的小型 BERT 的完整训练、末轮保存与重新聚类评估。测试禁止真实 API 请求，不下载 BERT 权重。
+
+本地小型 CPU 测试证明实现路径可运行，不代替实验室服务器上的完整 MRE / GPU / 中转站实验。旧分数不能当作这些新设置的实测结果。
