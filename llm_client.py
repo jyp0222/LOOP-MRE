@@ -1,4 +1,4 @@
-"""Audited Chat Completions transport for the original LOOP prompts.
+"""Audited Chat Completions transport for FewRel relation prompts.
 
 Uses requests rather than the OpenAI SDK so the original Python 3.8 / openai
 0.28 training environment can be retained. No network call or key prompt occurs
@@ -13,7 +13,7 @@ Local configuration errors and request-budget exhaustion always stop the run.
 max_requests caps HTTP attempts per client instance, including failed attempts
 and retries; it is not a monetary limit. Restarting creates a new attempt budget.
 
-The requested 0301 model identifier does not verify the proxy's backend snapshot.
+The requested model identifier does not verify the proxy's backend snapshot.
 The returned model identifier and any mismatch are recorded separately.
 """
 
@@ -31,9 +31,9 @@ import warnings
 from urllib.parse import urlparse
 
 import requests
+from mre_prompts import PROMPT_VERSION, NEIGHBOR_INSTRUCTIONS, NAMING_INSTRUCTIONS
 
 
-PROMPT_VERSION = "loop-original-intent-choice-chat-v3"
 SUPPORTED_MODELS = ("gpt-3.5-turbo-0301", "gpt-3.5-turbo", "gpt-3.5-turbo-0125", "gpt-3.5-turbo-1106")
 
 
@@ -50,7 +50,7 @@ class LLMBudgetExceeded(LLMError):
 
 
 class LLMClient:
-    """Original LOOP text prompts/parsing with JSONL caching and audit logs.
+    """FewRel prompts with LOOP Choice parsing, JSONL caching and audit logs.
 
     Key precedence: explicit api_key, explicit api_key_file, OPENAI_API_KEY,
     then an interactive hidden prompt. An explicitly configured empty/missing
@@ -60,7 +60,7 @@ class LLMClient:
 
     def __init__(
         self,
-        model="gpt-3.5-turbo-0301",
+        model="gpt-3.5-turbo",
         reasoning_effort=None,
         api_key=None,
         api_key_file=None,
@@ -135,7 +135,7 @@ class LLMClient:
         self._load_cache()
 
     def choose_neighbor(self, query, choices):
-        """Return index 0/1 using the original prompt and Choice 1 precedence.
+        """Compare directed entity relations; retain LOOP's Choice 1 precedence.
 
         The caller supplies the same tokenizer-decoded strings used upstream.
         API/malformed-answer failures select index 0, matching upstream q1.
@@ -143,19 +143,17 @@ class LLMClient:
         self._check_text(query, "query")
         self._check_text_list(choices, "choices", count=2)
         prompt = (
-            "Select the customer utterance that better corresponds with the Query in terms of intent. "
-            "Please respond with 'Choice 1' or 'Choice 2' without explanation. \n Query: "
-            + query + "\n Choice 1: " + choices[0] + "\n Choice 2: " + choices[1]
+            NEIGHBOR_INSTRUCTIONS + "\n\nQuery: " + query
+            + "\nChoice 1: " + choices[0] + "\nChoice 2: " + choices[1]
         )
         return self._query("choose_neighbor", [{"role": "user", "content": prompt}])["choice"]
 
     def name_cluster(self, samples):
-        """Return the raw naming text for the original three-utterance prompt."""
+        """Name the directed relation supported by the three cluster examples."""
         self._check_text_list(samples, "samples", count=3)
         prompt = (
-            "Given the following customer utterances, return a word or a phrase to summarize "
-            "the common intent of these utterances without explanation. \n Utterance 1: "
-            + samples[0] + "\n Utterance 2: " + samples[1] + "\n Utterance 3: " + samples[2]
+            NAMING_INSTRUCTIONS + "\n\nExample 1: " + samples[0]
+            + "\nExample 2: " + samples[1] + "\nExample 3: " + samples[2]
         )
         return self._query("name_cluster", [
             {"role": "system", "content": "You are a helpful assistant."},
@@ -251,6 +249,7 @@ class LLMClient:
             "time_utc": datetime.now(timezone.utc).isoformat(),
             "request_key": key,
             "task": task,
+            "prompt_version": PROMPT_VERSION,
             "status": status,
             "requested_model": requested_model,
             "reasoning_effort": self.reasoning_effort,

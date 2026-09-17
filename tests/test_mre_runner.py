@@ -11,9 +11,9 @@ def test_default_runner_constructs_gpt35_client_without_key_or_network(monkeypat
     monkeypatch.setattr('llm_client.requests.post', forbidden)
     monkeypatch.setattr('llm_client.getpass', forbidden)
     args = run_mre.build_parser().parse_args([])
-    assert args.model == 'gpt-3.5-turbo-0301'
+    assert args.model == 'gpt-3.5-turbo'
     client = run_mre.create_client(args)
-    assert client.model == 'gpt-3.5-turbo-0301'
+    assert client.model == client.naming_model == 'gpt-3.5-turbo'
     assert client.reasoning_effort is None
     assert client.endpoint == run_mre.defaults.API_BASE.rstrip('/') + '/chat/completions'
     assert client.max_output_tokens is None
@@ -51,6 +51,7 @@ def test_check_llm_reports_actual_version_without_loading_training(monkeypatch, 
     assert 'response model: gpt-3.5-turbo-0125' in output
     assert 'Choice 1' in output
     assert 'UNVERIFIED' in output
+    assert 'Prompt version: fewrel-directed-relation-choice-v4' in output
 
 
 def test_check_llm_rejects_fallback_instead_of_claiming_connection_passed(monkeypatch):
@@ -72,6 +73,9 @@ def test_original_defaults_and_mre_exceptions_are_explicit():
     assert cfg['view_strategy'] == 'rtr' and cfg['rtr_prob'] == .25
     assert cfg['name_clusters'] is True
     assert cfg['max_queries_per_refresh'] is None
+    assert cfg['model'] == cfg['naming_model'] == 'gpt-3.5-turbo'
+    assert cfg['prompt_version'] == 'fewrel-directed-relation-choice-v4'
+    assert cfg['experiment_variant'] == 'loop_mre_fewrel_gpt35_v2'
     assert 'known_cls_ratio' not in cfg and 'labeled_ratio' not in cfg
     for args in (['--no-llm'], ['--smoke'], ['--no-name-clusters']):
         assert not run_mre.experiment_config(run_mre.build_parser().parse_args(args))['name_clusters']

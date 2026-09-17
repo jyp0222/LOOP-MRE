@@ -1,7 +1,5 @@
-"""Offline compatibility tests: original prompts/parser and auditable transport."""
-import ast
+"""Offline tests: FewRel prompts, LOOP Choice parser and auditable transport."""
 import json
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -10,7 +8,6 @@ import requests
 import llm_client
 from llm_client import LLMClient, LLMError, LLMConfigurationError, LLMBudgetExceeded
 
-ROOT = Path(__file__).resolve().parents[1]
 KEY = "private-test-key-never-log"
 QUERY = "tokenizer decoded query"
 CHOICES = ["tokenizer decoded first", "tokenizer decoded second"]
@@ -26,7 +23,7 @@ def offline(monkeypatch):
     monkeypatch.setattr(llm_client.time, "sleep", lambda seconds: None)
 
 
-def completion(text="Choice 2", model="gpt-3.5-turbo-0301", finish="stop"):
+def completion(text="Choice 2", model="gpt-3.5-turbo", finish="stop"):
     return {"id": "test-id", "model": model, "choices": [
         {"message": {"content": text}, "finish_reason": finish}],
         "usage": {"prompt_tokens": 30, "completion_tokens": 3, "total_tokens": 33,
@@ -43,41 +40,45 @@ def stub(monkeypatch, response=None, status=200):
     return calls
 
 
-def original_prompt(relative_path, locals_):
-    """Read/evaluate only the upstream prompt assignment, without importing legacy code."""
-    tree = ast.parse((ROOT / relative_path).read_text(encoding="utf-8"))
-    node = next(node for node in ast.walk(tree) if isinstance(node, ast.Assign)
-                and any(isinstance(target, ast.Name) and target.id == "prompt" for target in node.targets))
-    return eval(compile(ast.Expression(node.value), "<upstream prompt>", "eval"),
-                {"__builtins__": {}}, locals_)
-
-
-def test_neighbor_request_matches_upstream_prompt_and_api_defaults(monkeypatch):
+def test_neighbor_request_compares_directed_relations_and_keeps_api_defaults(monkeypatch):
     calls = stub(monkeypatch)
     client = LLMClient(api_key=KEY)
     assert client.choose_neighbor(QUERY, CHOICES) == 1
     url, request = calls[0]
     assert url == "https://api.openai.com/v1/chat/completions"
-    assert request["json"] == {
-        "model": "gpt-3.5-turbo-0301",
-        "messages": [{"role": "user", "content": original_prompt(
-            "utils/neighbor_dataset.py", dict(s=QUERY, s1=CHOICES[0], s2=CHOICES[1]))}]}
+    payload = request['json']
+    assert set(payload) == {'model', 'messages'}
+    assert payload['model'] == 'gpt-3.5-turbo'
+    assert len(payload['messages']) == 1 and payload['messages'][0]['role'] == 'user'
+    prompt = payload['messages'][0]['content']
+    assert 'directed relation from Head to Tail' in prompt
+    assert 'supported by the Sentence' in prompt
+    assert 'not shared entity names, entity types alone' in prompt
+    assert 'Do not reverse Head and Tail' in prompt
+    assert 'Respond only with \'Choice 1\' or \'Choice 2\'' in prompt
+    assert 'customer utterance' not in prompt and 'intent' not in prompt
+    assert prompt.endswith('Query: ' + QUERY + '\nChoice 1: ' + CHOICES[0] + '\nChoice 2: ' + CHOICES[1])
     assert request["headers"]["Authorization"] == "Bearer " + KEY
     assert request["allow_redirects"] is False
     assert client.requests_made == 1 and client.fallback_count == 0
     assert client.snapshot_verified is False
 
 
-def test_naming_uses_original_alias_system_and_three_decoded_examples(monkeypatch):
-    calls = stub(monkeypatch, completion(" common intent ", model="gpt-3.5-turbo"))
+def test_naming_uses_same_model_and_names_head_to_tail_relation(monkeypatch):
+    calls = stub(monkeypatch, completion(" place of birth "))
     client = LLMClient(api_key=KEY)
     samples = ["one", "two", "three"]
-    assert client.name_cluster(samples) == " common intent "
-    assert calls[0][1]["json"] == {
-        "model": "gpt-3.5-turbo", "messages": [
-            {"role": "system", "content": "You are a helpful assistant."},
-            {"role": "user", "content": original_prompt(
-                "loop.py", dict(s1="one", s2="two", s3="three"))}]}
+    assert client.name_cluster(samples) == " place of birth "
+    payload = calls[0][1]['json']
+    assert set(payload) == {'model', 'messages'}
+    assert payload['model'] == client.model == 'gpt-3.5-turbo'
+    assert payload['messages'][0] == {'role': 'system', 'content': 'You are a helpful assistant.'}
+    prompt = payload['messages'][1]['content']
+    assert 'semantic relation from Head to Tail' in prompt
+    assert 'short English relation name' in prompt
+    assert "return 'unclear relation'" in prompt
+    assert 'common intent' not in prompt
+    assert prompt.endswith('Example 1: one\nExample 2: two\nExample 3: three')
 
 
 @pytest.mark.parametrize("text,expected", [
@@ -91,7 +92,7 @@ def test_original_case_sensitive_substring_and_choice1_precedence(monkeypatch, t
 
 @pytest.mark.parametrize("response", [
     completion("choice 2"), completion("neither"), completion(None),
-    {"model": "gpt-3.5-turbo-0301", "choices": []},
+    {"model": "gpt-3.5-turbo", "choices": []},
     completion("Choice 2", model="unrecognized-backend"),
 ])
 def test_bad_neighbor_answers_use_observable_uncached_q1_fallback(monkeypatch, tmp_path, response):
@@ -114,7 +115,7 @@ def test_http_failure_never_switches_model_and_is_not_silent(monkeypatch, tmp_pa
     with pytest.warns(RuntimeWarning, match="q1 fallback"):
         assert client.choose_neighbor(QUERY, CHOICES) == 0
     assert len(calls) == client.requests_made == 1
-    assert all(call[1]["json"]["model"] == "gpt-3.5-turbo-0301" for call in calls)
+    assert all(call[1]["json"]["model"] == "gpt-3.5-turbo" for call in calls)
     assert KEY not in (tmp_path / "calls.jsonl").read_text()
 
 
@@ -169,7 +170,7 @@ def test_persistent_cache_is_private_and_needs_no_credentials(monkeypatch, tmp_p
 
 
 @pytest.mark.parametrize("changed", [
-    {"base_url": "https://proxy.example/v1"}, {"model": "gpt-3.5-turbo"},
+    {"base_url": "https://proxy.example/v1"}, {"model": "gpt-3.5-turbo-0125"},
     {"max_output_tokens": 64}])
 def test_cache_does_not_cross_endpoint_model_or_generation_settings(monkeypatch, tmp_path, changed):
     stub(monkeypatch)
@@ -185,7 +186,7 @@ def test_old_prompt_version_cache_is_not_reused(monkeypatch, tmp_path):
     cache = tmp_path / "cache.jsonl"
     LLMClient(api_key=KEY, cache_path=cache).choose_neighbor(QUERY, CHOICES)
     record = json.loads(cache.read_text())
-    record["version"] = "previous-json-relation-prompt"
+    record["version"] = "loop-original-intent-choice-chat-v3"
     cache.write_text(json.dumps(record))
     with pytest.raises(LLMBudgetExceeded):
         LLMClient(cache_path=cache, max_requests=0).choose_neighbor(QUERY, CHOICES)
@@ -218,12 +219,12 @@ def test_key_file_precedence_and_missing_file(monkeypatch, tmp_path):
 
 
 def test_response_alias_mismatch_is_recorded_without_claiming_snapshot(monkeypatch):
-    stub(monkeypatch, completion(model="gpt-3.5-turbo"))
+    stub(monkeypatch, completion(model="gpt-3.5-turbo-0125"))
     client = LLMClient(api_key=KEY)
     with pytest.warns(RuntimeWarning, match="snapshot is unverified"):
         assert client.choose_neighbor(QUERY, CHOICES) == 1
-    assert client.model == "gpt-3.5-turbo-0301"
-    assert client.last_response_model == "gpt-3.5-turbo"
+    assert client.model == "gpt-3.5-turbo"
+    assert client.last_response_model == "gpt-3.5-turbo-0125"
     assert client.last_response_model_matches_request is False
     assert client.model_mismatch_count == 1 and client.snapshot_verified is False
 

@@ -1,6 +1,6 @@
 # MRE text-only experiments (fixed 64 base / 16 novel)
 
-本分支在保留 MRE 固定 64/16 类、传导式样本划分和 MRE 计分的前提下，恢复原 LOOP 的普通随机采样、k=50、batch=64/128/64、RTR、末轮模型及测试集 KMeans。邻居请求 `gpt-3.5-turbo-0301`（中转站实际快照未核实），命名请求原版的 `gpt-3.5-turbo`。服务器入口为 `run_mre.py`，参数写在 `mre_config.py`，新实验标识为 `loop_original_mre_v1`。
+本分支保留 MRE 固定 64/16 类、传导式样本划分和 MRE 计分，并采用原 LOOP 的普通随机采样、k=50、batch=64/128/64、RTR、末轮模型及测试集 KMeans。当前邻居选择与簇命名统一请求 `gpt-3.5-turbo`，提示词针对 FewRel 的 Head→Tail 实体关系，不再比较客户意图；中转站实际后端快照未核实。服务器入口为 `run_mre.py`，参数写在 `mre_config.py`，提示词写在 `mre_prompts.py`，实验标识为 `loop_mre_fewrel_gpt35_v2`。
 
 **[查看中文实验协议、改动说明与服务器操作步骤 → README_MRE.md](README_MRE.md)**
 

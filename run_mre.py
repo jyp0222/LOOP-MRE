@@ -8,6 +8,7 @@ import platform
 import subprocess
 
 import mre_config as defaults
+from mre_prompts import PROMPT_VERSION
 
 
 def experiment_config(args):
@@ -22,6 +23,7 @@ def experiment_config(args):
                   model=args.model, reasoning_effort=args.reasoning_effort,
                   api_base=defaults.API_BASE, max_output_tokens=defaults.MAX_OUTPUT_TOKENS,
                   naming_model=defaults.NAMING_MODEL_NAME, llm_snapshot_verified=False,
+                  prompt_version=PROMPT_VERSION,
                   checkpoint_selection='last_epoch', evaluation='test_kmeans',
                   request_timeout=defaults.REQUEST_TIMEOUT, max_retries=defaults.MAX_RETRIES,
                   max_requests=args.max_requests, max_queries_per_refresh=None)
@@ -183,12 +185,14 @@ def main(argv=None):
             raise RuntimeError('API check failed: Choice 1 was only the upstream error fallback; no valid LLM answer')
         print('Requested model: {}; response model: {}; answer: Choice {}'.format(
             client.model, client.last_response_model, answer + 1))
-        print('Provider snapshot provenance: UNVERIFIED (model field is not proof of original 0301 weights).')
+        print('Prompt version: {}'.format(PROMPT_VERSION))
+        print('Provider snapshot provenance: UNVERIFIED (model field does not verify backend weights).')
         return
     config = experiment_config(args)
     from mre_protocol import prepare_dataset
     stamp = datetime.now().strftime('%Y%m%d_%H%M%S_%f')
-    run_dir = args.output_root.resolve() / 'loop_original_mre_seed{}_{}'.format(config['seed'], stamp)
+    run_dir = args.output_root.resolve() / '{}_seed{}_{}'.format(
+        config['experiment_variant'], config['seed'], stamp)
     # prepare_dataset creates this unique run's immutable data directory.
     manifest = prepare_dataset(args.source_dir, run_dir / 'data', config['seed'], config['position_format'])
     print('Run directory: {}'.format(run_dir), flush=True)
@@ -231,6 +235,7 @@ def main(argv=None):
                 'http_attempts': client.requests_made, 'cache_hits': client.cache_hits,
                 'requested_model': client.model, 'reasoning_effort': client.reasoning_effort,
                 'naming_model': client.naming_model, 'fallback_count': client.fallback_count,
+                'prompt_version': PROMPT_VERSION,
                 'response_models': sorted(client.response_models),
                 'model_mismatch_count': client.model_mismatch_count,
                 'snapshot_verified': False,

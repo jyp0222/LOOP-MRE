@@ -286,8 +286,9 @@ class MRETrainer:
                     'epoch': cfg['train_epochs'], 'selection': 'last_epoch', 'evaluation': 'test_kmeans',
                     'n_base': data.n_base, 'n_total': data.n_total}, self.run_dir / 'last_model.pt')
         result = {'protocol': data.manifest['protocol'], 'seed': cfg['seed'],
-                  'method': 'LOOP-original-MRE-GPT' if self.client else 'LOOP-original-MRE-no-LLM',
+                  'method': 'LOOP-MRE-GPT-FewRelPrompt' if self.client else 'LOOP-original-MRE-no-LLM',
                   'experiment_variant': cfg['experiment_variant'],
+                  'prompt_version': cfg['prompt_version'] if self.client else None,
                   'model': self.client.model if self.client else None,
                   'reasoning_effort': None,
                   'checkpoint_selection': 'last_epoch', 'checkpoint_epoch': cfg['train_epochs'],

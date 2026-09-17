@@ -6,13 +6,13 @@ SOURCE_DIR = Path('/home/zhoubaohang/FewRel')  # original train.txt / test.txt
 BERT_MODEL = Path('/home/zhoubaohang/jiangyipeng/LOOP/pretrained/bert-base-uncased')
 TOKENIZER = BERT_MODEL
 OUTPUT_ROOT = ROOT / 'outputs'
-EXPERIMENT_VARIANT = 'loop_original_mre_v1'
+EXPERIMENT_VARIANT = 'loop_mre_fewrel_gpt35_v2'
 
 # API key is requested invisibly on the first uncached call. Alternatively,
 # point this to a PRIVATE text file outside this Git repository.
 API_KEY_FILE = None
-MODEL_NAME = 'gpt-3.5-turbo-0301'  # provider route requested explicitly; snapshot UNVERIFIED
-NAMING_MODEL_NAME = 'gpt-3.5-turbo'  # the original LOOP uses this alias for cluster naming
+MODEL_NAME = 'gpt-3.5-turbo'  # available provider route; backend snapshot UNVERIFIED
+NAMING_MODEL_NAME = 'gpt-3.5-turbo'  # same model for both relation selection and naming
 REASONING_EFFORT = None  # GPT-3.5 has no reasoning mode; not sent to the API
 API_BASE = 'https://api.zhizengzeng.com/v1'
 MAX_OUTPUT_TOKENS = None  # upstream omits max_tokens; do not send JSON mode or reasoning options
