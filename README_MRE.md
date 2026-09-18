@@ -166,7 +166,7 @@ python -u run_mre.py --seed 0 --no-llm
 python -u run_mre.py --seed 0
 ```
 
-确认正常后，分别将 seed 改为 1、2，按相同设置重做有/无 LLM 的配对实验。正式 LLM 运行默认还会在计分后做 16 个 novel 簇命名请求；可以明确使用 `--no-name-clusters` 省去该解释步骤，其关闭不改变此前的训练和分数。
+确认正常后，分别将 seed 改为 2、3，按相同设置重做有/无 LLM 的配对实验（正式集合为 0、2、3，seed 1 可保留为额外记录）。正式 LLM 运行默认还会在计分后做 16 个 novel 簇命名请求；可以明确使用 `--no-name-clusters` 省去该解释步骤，其关闭不改变此前的训练和分数。
 
 `--max-requests N` 是当前进程的 HTTP 尝试上限（包含失败/显式重试），不是费用上限；达到上限会停止，不把后续候选悄悄改成无 LLM。默认每个请求一次尝试。完整 50 轮实验会更新近邻多次，不要沿用 smoke 的 20 次上限。
 
@@ -199,6 +199,8 @@ python -u run_mre.py --evaluate-run outputs/loop_mre_fewrel_gpt35_v2_seed0_实�
 会载入末轮权重，在测试特征上重做 KMeans，并输出 `predictions_identical`。旧结果目录的 config 若没有 `evaluation=test_kmeans`，仍按旧的 best_model+固定中心方式复查；不会把旧模型自动解释为新 baseline。
 
 ## 7. 离线验证
+
+已有运行的 GPT 邻居质量审计见 [README_NEIGHBOR_AUDIT.md](README_NEIGHBOR_AUDIT.md)。只需 Python 标准库；读取既有决策和数据，不训练、不调用 API，也不更改原 baseline。
 
 `python -m pytest tests -q` 覆盖数据划分与泄漏边界、MRE 全局匹配、随机采样、FewRel 提示词与 Choice 返回契约、旧提示词缓存隔离、FAISS/LIS 与原源码对照、API 回退/缓存/预算，以及合成文本和本地生成的小型 BERT 的完整训练、末轮保存与重新聚类评估。测试禁止真实 API 请求，不下载 BERT 权重。
 
