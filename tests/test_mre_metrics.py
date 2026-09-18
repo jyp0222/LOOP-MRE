@@ -32,7 +32,13 @@ class MREMetricsTests(unittest.TestCase):
             rng = np.random.RandomState(seed)
             truth = np.concatenate((np.arange(80), rng.randint(80, size=120)))
             pred = rng.randint(80, size=truth.size)
-            self.assertEqual(mre_accuracy(truth, pred), reference_mre(truth, pred, 64, 80))
+            self.assertEqual(mre_accuracy(truth, pred), reference_mre(truth, pred, 40, 80))
+
+    def test_explicit_legacy_64_16_split_remains_supported(self):
+        truth = [0, 39, 40, 63, 64, 79]
+        pred = [0, 39, 40, 40, 64, 79]
+        self.assertEqual(mre_accuracy(truth, pred, n_base=64, n_total=80),
+                         reference_mre(truth, pred, 64, 80))
 
     def test_global_mapping_not_independent_subset_matching(self):
         scores = mre_accuracy([0, 0, 0, 1, 1], [0, 0, 0, 0, 0], n_base=1, n_total=2)
@@ -46,9 +52,9 @@ class MREMetricsTests(unittest.TestCase):
                          {"Base": None, "Novel": 1.0, "Overall": 1.0})
 
     def test_perfect_permutation_and_no_rounding(self):
-        self.assertEqual(mre_accuracy([0, 64], [79, 5]),
+        self.assertEqual(mre_accuracy([0, 40], [79, 5]),
                          {"Base": 1.0, "Novel": 1.0, "Overall": 1.0})
-        result = mre_accuracy([0, 0, 64], [0, 0, 0])
+        result = mre_accuracy([0, 0, 40], [0, 0, 0])
         self.assertEqual(result["Overall"], 2 / 3)
 
     def test_invalid_arrays(self):

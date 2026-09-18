@@ -163,7 +163,7 @@ class TrainingIntegrationTests(unittest.TestCase):
                                       num_hidden_layers=1, num_attention_heads=12,
                                       intermediate_size=32, max_position_embeddings=64)).save_pretrained(backbone)
             run_dir = root / 'run'
-            prepare_dataset(root / 'source', run_dir / 'data', expected_base=2, expected_novel=1)
+            prepare_dataset(root / 'source', run_dir / 'data', expected_total=3)
             data = MREData(run_dir / 'data', tokenizer, max_length=32,
                            labeled_batch_size=4, train_batch_size=12, eval_batch_size=12)
             args = build_parser().parse_args(['--no-llm', '--bert-model', str(backbone),
@@ -180,7 +180,7 @@ class TrainingIntegrationTests(unittest.TestCase):
                 result = trainer.train()
                 self.assertTrue((run_dir / 'last_model.pt').is_file())
                 self.assertFalse((run_dir / 'best_model.pt').exists())
-                self.assertEqual(result['n_test'], 20)
+                self.assertEqual(result['n_test'], 28)
                 self.assertEqual(result['model'], None)
                 loops = [record for record in trainer.history if record['stage'] == 'loop']
                 self.assertEqual([row['epoch'] for row in loops], [1, 2])
@@ -202,7 +202,7 @@ class TrainingIntegrationTests(unittest.TestCase):
             stored = [json.loads(line) for line in (run_dir / 'predictions.jsonl').read_text().splitlines()]
             self.assertEqual([r['prediction'] for r in stored], predictions.tolist())
             self.assertEqual(metrics, mre_accuracy([r['label'] for r in stored],
-                                                   [r['prediction'] for r in stored], 2, 3))
+                                                   [r['prediction'] for r in stored], 1, 3))
             self.assertEqual([r['epoch'] for r in trainer.history if r['stage'] == 'intermediate_test'], [1])
             stored[0]['label'] = (stored[0]['label'] + 1) % data.n_total
             (run_dir / 'predictions.jsonl').write_text('\n'.join(json.dumps(row) for row in stored))

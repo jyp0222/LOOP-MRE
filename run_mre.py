@@ -196,7 +196,10 @@ def main(argv=None):
     # prepare_dataset creates this unique run's immutable data directory.
     manifest = prepare_dataset(args.source_dir, run_dir / 'data', config['seed'], config['position_format'])
     print('Run directory: {}'.format(run_dir), flush=True)
-    print('Fixed classes: {} base / {} novel'.format(manifest['n_base'], manifest['n_novel']))
+    print('MRE random-half classes: {} base / {} novel (seed={})'.format(
+        manifest['n_base'], manifest['n_novel'], config['seed']))
+    print('Base:', manifest['base_classes'])
+    print('Novel:', manifest['novel_classes'])
     print('Split counts: {}'.format({name: split['count'] for name, split in manifest['splits'].items()}))
     print('Data audit: {}'.format(manifest['audit']), flush=True)
     print('Experiment variant: {}; k={}; batch={}/{}/{}; view={}; last-epoch selection; test KMeans'.format(
@@ -206,6 +209,7 @@ def main(argv=None):
     if not (args.no_llm or args.prepare_only or args.check_data):
         client = create_client(args, run_dir)
         config['reasoning_effort'] = client.reasoning_effort
+    config['data_protocol'] = manifest['protocol']
     config['runtime'] = runtime_info()
     config['manifest_sha256'] = hashlib.sha256((run_dir / 'data' / 'manifest.json').read_bytes()).hexdigest()
     (run_dir / 'config.json').write_text(json.dumps(config, ensure_ascii=False, indent=2) + '\n', encoding='utf-8')

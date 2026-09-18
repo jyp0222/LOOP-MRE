@@ -1,12 +1,19 @@
-# MRE 文本数据上的 LOOP baseline 与 FewRel 关系提示词
+# MRE 默认随机 40/40 类别协议上的 LOOP 文本 baseline
 
-本分支按确认的实验要求，采用原 LOOP 的采样、超参数、模型选择和邻居构造；保留 **MRE 固定 64 个 base / 16 个 novel、MRE 样本协议和 MRE 评估指标**。只使用文本与有方向的实体对，不读取图片。由于当前中转站/key 请求 `0301` 返回 404，而普通版本已测试成功，最新设置统一请求 `gpt-3.5-turbo`，并按要求将 GPT 提示词改为 FewRel 的有向实体关系任务。
+本分支 **`codex/mre-random-40-40` 直接从 `fc2574273a57eb11d6c084db292268af5b826cd9` 建立**，不基于、也不包含离线审计提交 `2ccf1b1`。`fc25742` 是引入普通 GPT-3.5 与 FewRel 提示词的六组实验所对应的代码版本；其中旧 no-LLM seed=2 结果来自更早记录，缺少该次服务器配置，不能声称六次服务器 commit 全相同。此次只改变类别及随之关联的样本划分、标签边界和实验标识；训练算法、GPT 模型和提示词保持该版本。
 
-入口为 `run_mre.py`，服务器路径与参数集中在 `mre_config.py`，不需要 export。当前实验标识及输出前缀为 `loop_mre_fewrel_gpt35_v2`，提示词版本为 `fewrel-directed-relation-choice-v4`。此前六组采用验证集选 LOOP 模型的结果以及 `loop_original_mre_v1` 的原意图提示词实验都需单独记录，不混合计算均值。本次仅调整模型、提示词和实验元数据，其余训练/数据设置保持不变。
+入口为 `run_mre.py`，服务器路径与参数集中在 `mre_config.py`，不需要 export。新实验标识及输出前缀为 `loop_mre_random40_gpt35_v3`，提示词仍为 `fewrel-directed-relation-choice-v4`，请求模型仍为 `gpt-3.5-turbo`。旧固定 64/16 的六组最终成绩不能改名充当随机 40/40 成绩，也不与新协议混合计算均值。
 
-## 1. 保留的 MRE 协议
+## 1. 严格对齐 MRE 默认类别与样本划分
 
-类别分别来自原始 `train.txt` 的 64 类和 `test.txt` 的 16 类，按首次出现顺序记录到 manifest；标签编号分别为 0–63 和 64–79，不重新随机选已知类。
+对照 MRE_learn 的 `utils.py:split_types` 和 `data_loader.py:split_dataset`，步骤如下：
+
+1. 按 `train.txt` 然后 `test.txt` 的文件顺序逐行读取，合并样本。原始文件不再决定 Base/Novel 身份；同一关系跨文件出现时也合并。
+2. 按关系首次出现顺序建表，过滤 `Other/None/none/NA`，不按字母排序。本数据要求过滤后共 80 类。
+3. `rng = np.random.RandomState(seed)`，对这张关系表做一次 `rng.shuffle`；前 40 类为 Base，后 40 类为 Novel。标签分别为 0–39、40–79。
+4. 按打乱后的 Base 类顺序，使用**同一个 RNG 继续**打乱各类样本，不能在类别划分后重新设 seed；样本比例与取整公式如下。
+
+使用相同源文件内容、顺序和 seed 时，本实现与上述原 MRE 划分函数的类别名单和样本成员/顺序一致。使用局部 RandomState 避免受外部 NumPy 调用影响，其算法与原 `np.random.seed(seed)` 后连续 shuffle 相同。不同 seed 会同时改变类别身份和 Base 样本划分。运行会打印 Base/Novel 完整名单；manifest 保存打乱前后名单、源文件哈希及样本 ID，供与服务器 MRE 实际名单逐项核对。
 
 对每个有 n 条记录的 base 类：
 
@@ -26,7 +33,7 @@ n_test = n - n_train_val
 | base 测试部分 + 全部 novel | 无标签训练；中途与最终测试计分 |
 | 图片 | 完全不加载 |
 
-当前原始数据预期得到 1006 条有标签训练、2416 条无标签训练、282 条验证和 2416 条测试；联合训练池为 3422 条。运行输出及 manifest 是实际数量的依据。不存在额外的 `labeled_ratio=0.1` 抽样。
+样本数随 seed 抽中的 Base 类而变化，以当次输出和 manifest 为准；旧固定 64/16 的 1006/2416/282/2416 不再是新协议的预期数量。不存在额外的 `labeled_ratio=0.1` 抽样。
 
 `mre_protocol.py` 的原有数据策略保持不变：
 
@@ -60,7 +67,7 @@ n_test = n - n_train_val
 | 最终预测 | 末轮特征，在**测试集上重新拟合 80 类 KMeans** | loop.py: evaluation | mre_trainer.py: cluster_score_loader |
 | 最终指标 | **MRE Base / Novel / Overall** | 本次保留的 MRE 要求 | mre_metrics.py |
 
-KMeans 显式设置 `n_init=10`，对应原仓库指定的 scikit-learn 1.2 默认行为，避免随新版库默认值变化。聚类数固定为 80。模型继续复用原 `model.py`：BERT CLS 768 维，对比投影 128 维，监督分类头 64 类，没有新增网络或损失。
+KMeans 显式设置 `n_init=10`，对应原仓库指定的 scikit-learn 1.2 默认行为，避免随新版库默认值变化。聚类数固定为 80。模型继续复用原 `model.py`：BERT CLS 768 维，对比投影 128 维，监督分类头随 manifest 自动变为 40 类，没有新增网络或损失。
 
 原 LOOP 每 5 轮会报告测试聚类成绩，本入口也恢复这一输出，`history.json` 中标为 `intermediate_test`。**这些成绩不参与早停、选模型或参数更新**；默认正式结果始终来自第 50 轮。不要看到中途更高的测试分数就替换最终结果。
 
@@ -112,17 +119,19 @@ API 默认只发送 model 和 messages，不发送 JSON mode、reasoning、tempe
 
 ## 5. 服务器操作
 
-使用此前已跑通的 `loop-mre` 环境，先更新已有工作副本：
+使用此前已跑通的 `loop-mre` 环境。建议在旧项目旁新建工作副本，保留旧六组结果及本地配置，不在旧分支 pull 或 reset：
 
 ```bash
 conda activate loop-mre
-cd /home/zhoubaohang/jiangyipeng/LOOP-MRE-mre-protocol
-git status --short
-git -c http.version=HTTP/1.1 pull --rebase --autostash origin codex/mre-fixed-protocol
+cd /home/zhoubaohang/jiangyipeng
+git -c http.version=HTTP/1.1 clone --depth 1 --single-branch \
+  --branch codex/mre-random-40-40 \
+  https://github.com/jyp0222/LOOP-MRE.git LOOP-MRE-random40
+cd LOOP-MRE-random40
 git rev-parse --short HEAD
 ```
 
-不要使用 `--ff-only --autostash`，该服务器 Git 不支持此组合。若自动恢复本地配置时出现冲突，先处理冲突再运行；旧 outputs 不需要删除。
+目标目录已存在时不要覆盖，另选新目录名。只按实际情况填写路径/API key 文件，不要用旧 `mre_config.py` 整体覆盖新配置。旧 outputs 不需要删除或搬动。
 
 检查 `mre_config.py` 中这些值，尤其本地旧配置不要盖回旧参数：
 
@@ -144,7 +153,8 @@ VIEW_STRATEGY = 'rtr'
 
 ```bash
 python -c "import faiss; print('FAISS:', faiss.__version__)"
-python -u run_mre.py --check-data
+python -u run_mre.py --prepare-only --seed 0
+python -u run_mre.py --check-data --seed 0
 python -u run_mre.py --check-llm
 python -u run_mre.py --smoke --seed 0 --max-requests 20
 ```
@@ -166,7 +176,7 @@ python -u run_mre.py --seed 0 --no-llm
 python -u run_mre.py --seed 0
 ```
 
-确认正常后，分别将 seed 改为 1、2，按相同设置重做有/无 LLM 的配对实验。正式 LLM 运行默认还会在计分后做 16 个 novel 簇命名请求；可以明确使用 `--no-name-clusters` 省去该解释步骤，其关闭不改变此前的训练和分数。
+确认正常后，分别将 seed 改为 2、3，按相同设置重做有/无 LLM 的配对实验，正式集合为 0、2、3。每个 seed 的有/无 LLM 必须使用相同源文件和 manifest 类别/样本名单。正式 LLM 运行默认还会在计分后做 40 个 novel 簇命名请求；可以明确使用 `--no-name-clusters` 省去该解释步骤，其关闭不改变此前的训练和分数。
 
 `--max-requests N` 是当前进程的 HTTP 尝试上限（包含失败/显式重试），不是费用上限；达到上限会停止，不把后续候选悄悄改成无 LLM。默认每个请求一次尝试。完整 50 轮实验会更新近邻多次，不要沿用 smoke 的 20 次上限。
 
@@ -176,7 +186,7 @@ python -u run_mre.py --seed 0
 
 | 文件 | 内容 |
 | --- | --- |
-| data/manifest.json | 64/16 类表、样本划分、源文件哈希、重复/歧义审计 |
+| data/manifest.json | protocol=mre_transductive_random_half、打乱前名单、40/40 类表、样本划分、源文件哈希、重复/歧义审计 |
 | tokenization_audit.json | 截断数量及最大 token 长度 |
 | history.json | 预训练分类 ACC、第二阶段 loss、定期间隔测试与调用计数 |
 | pretrain_selection.json | 预训练所选轮次、分数、完成轮数；平分保留较早轮 |
@@ -193,12 +203,14 @@ python -u run_mre.py --seed 0
 对新结果重新评估（不调用 API）：
 
 ```bash
-python -u run_mre.py --evaluate-run outputs/loop_mre_fewrel_gpt35_v2_seed0_实际时间戳
+python -u run_mre.py --evaluate-run outputs/loop_mre_random40_gpt35_v3_seed0_实际时间戳
 ```
 
-会载入末轮权重，在测试特征上重做 KMeans，并输出 `predictions_identical`。旧结果目录的 config 若没有 `evaluation=test_kmeans`，仍按旧的 best_model+固定中心方式复查；不会把旧模型自动解释为新 baseline。
+会载入末轮权重，在测试特征上重做 KMeans，并输出 `predictions_identical`。也可传旧项目结果的绝对路径：旧 fixed 协议仍可加载，分类头与计分边界取其原 manifest 的 64/16，不会强制改为 40/40。更早 config 若没有 `evaluation=test_kmeans`，仍按旧的 best_model+固定中心方式复查。复评旧权重不能替代新协议训练。
 
 ## 7. 离线验证
+
+`python -m unittest discover -s tests -p test_mre_random_protocol.py -v` 使用冻结的原 MRE `split_types` / `split_dataset` 函数作为独立参照，在合成 80 类数据上核对 seed 0、2、3 的完整类别名单及各子集样本 ID 顺序。它不加载图像或 BERT，不请求 API。
 
 `python -m pytest tests -q` 覆盖数据划分与泄漏边界、MRE 全局匹配、随机采样、FewRel 提示词与 Choice 返回契约、旧提示词缓存隔离、FAISS/LIS 与原源码对照、API 回退/缓存/预算，以及合成文本和本地生成的小型 BERT 的完整训练、末轮保存与重新聚类评估。测试禁止真实 API 请求，不下载 BERT 权重。
 

@@ -35,8 +35,9 @@ class MREProtocolTests(unittest.TestCase):
     def tearDown(self):
         self.temp.cleanup()
 
-    def fixture(self, base_count=2, novel_count=1, base_n=5, novel_n=3):
-        # Non-sorted order tests that class IDs come from source appearance.
+    def fixture(self, base_count=2, novel_count=2, base_n=5, novel_n=5):
+        # These names denote source files, not eventual Base/Novel identities.
+        # Non-sorted order tests first appearance before the seeded shuffle.
         bases = ["base-{:03d}".format(i) for i in reversed(range(base_count))]
         novels = ["novel-{:03d}".format(i) for i in reversed(range(novel_count))]
         train = [sample(label, 1000 * i + j) for i, label in enumerate(bases)
@@ -48,8 +49,7 @@ class MREProtocolTests(unittest.TestCase):
         return bases, novels, train, test
 
     def prepare(self, **kwargs):
-        kwargs.setdefault("expected_base", 2)
-        kwargs.setdefault("expected_novel", 1)
+        kwargs.setdefault("expected_total", 4)
         return prepare_dataset(self.source, self.root / "prepared", **kwargs)
 
     def test_single_position_contiguous_list_and_direction(self):
@@ -132,23 +132,28 @@ class MREProtocolTests(unittest.TestCase):
         self.assertEqual(manifest["sources"]["train"]["blank_token_examples"],
                          [{"line": 1, "positions": [0, 5]}])
         self.assertEqual({key: value["count"] for key, value in manifest["splits"].items()},
-                         {"train_labeled": 2, "validation": 2, "train_unlabeled": 9, "test": 9})
+                         {"train_labeled": 2, "validation": 2, "train_unlabeled": 16, "test": 16})
         self.assertEqual((self.source / "train.txt").read_bytes(), before)
 
     def test_exact_sample_split_counts_and_source_unchanged(self):
-        bases, novels, _, _ = self.fixture()
+        source_train, source_test, _, _ = self.fixture()
         before = {name: (self.source / name).read_bytes() for name in ("train.txt", "test.txt")}
         manifest = self.prepare(seed=7)
-        self.assertEqual(manifest["base_classes"], bases)
-        self.assertEqual(manifest["novel_classes"], novels)
-        self.assertEqual({key: value["count"] for key, value in manifest["splits"].items()},
-                         {"train_labeled": 2, "validation": 2, "train_unlabeled": 9, "test": 9})
         rng = np.random.RandomState(7)
+        classes = source_train + source_test
+        rng.shuffle(classes)
+        self.assertEqual(manifest["base_classes"], classes[:2])
+        self.assertEqual(manifest["novel_classes"], classes[2:])
+        self.assertEqual({key: value["count"] for key, value in manifest["splits"].items()},
+                         {"train_labeled": 2, "validation": 2, "train_unlabeled": 16, "test": 16})
         expected_labeled = []
-        for start in (1, 6):
+        for relation in classes[:2]:
+            source = "train" if relation in source_train else "test"
+            source_classes = source_train if source == "train" else source_test
+            start = source_classes.index(relation) * 5 + 1
             order = np.arange(5)
             rng.shuffle(order)
-            expected_labeled.append("train:{:08d}".format(start + int(order[0])))
+            expected_labeled.append("{}:{:08d}".format(source, start + int(order[0])))
         self.assertEqual(manifest["splits"]["train_labeled"]["ids"], expected_labeled)
         for name, original in before.items():
             self.assertEqual((self.source / name).read_bytes(), original)
@@ -161,17 +166,17 @@ class MREProtocolTests(unittest.TestCase):
         self.assertFalse(val_ids & unlab_ids)
         self.assertFalse(labeled_ids & unlab_ids)
 
-    def test_default_64_16_and_unlabeled_has_no_labels(self):
-        self.fixture(base_count=64, novel_count=16, base_n=4, novel_n=2)
+    def test_default_40_40_and_unlabeled_has_no_labels(self):
+        self.fixture(base_count=64, novel_count=16, base_n=4, novel_n=4)
         output = self.root / "prepared"
         manifest = prepare_dataset(self.source, output)
-        self.assertEqual((manifest["n_base"], manifest["n_novel"], manifest["n_total"]), (64, 16, 80))
+        self.assertEqual((manifest["n_base"], manifest["n_novel"], manifest["n_total"]), (40, 40, 80))
         labeled = read_rows(output / "train_labeled.jsonl")
         test = read_rows(output / "test.jsonl")
         unlab = read_rows(output / "train_unlabeled.jsonl")
-        self.assertEqual({row["label"] for row in labeled}, set(range(64)))
+        self.assertEqual({row["label"] for row in labeled}, set(range(40)))
         self.assertEqual({row["label"] for row in test}, set(range(80)))
-        self.assertEqual(len(unlab), 160)
+        self.assertEqual(len(unlab), 240)
         self.assertTrue(all(set(row) == {"id", "text"} for row in unlab))
         self.assertEqual(unlab, [{"id": row["id"], "text": row["text"]} for row in test])
         for filename, digest in manifest["file_sha256"].items():
@@ -181,7 +186,7 @@ class MREProtocolTests(unittest.TestCase):
         self.fixture()
         first = self.prepare(seed=11)
         second = prepare_dataset(self.source, self.root / "second", seed=11,
-                                 expected_base=2, expected_novel=1)
+                                 expected_total=4)
         self.assertEqual(first, second)
         for name in list(first["files"].values()) + ["manifest.json"]:
             self.assertEqual((self.root / "prepared" / name).read_bytes(),
@@ -190,18 +195,23 @@ class MREProtocolTests(unittest.TestCase):
             self.prepare(seed=11)
 
     def test_small_base_class_rejected_without_output(self):
-        self.fixture(base_n=3)
+        self.fixture(base_n=3, novel_n=3)
         with self.assertRaisesRegex(ValueError, "each must be nonempty"):
             self.prepare()
         self.assertFalse((self.root / "prepared").exists())
 
-    def test_disjoint_classes_and_expected_counts(self):
-        bases, _, _, _ = self.fixture()
-        with self.assertRaisesRegex(ValueError, "expected 64 base / 16 novel"):
+    def test_expected_unique_class_count_and_cross_file_class_merging(self):
+        bases, novels, _, test = self.fixture()
+        with self.assertRaisesRegex(ValueError, "expected 80"):
             prepare_dataset(self.source, self.root / "prepared")
-        write_rows(self.source / "test.txt", [sample(bases[0], 999)])
-        with self.assertRaisesRegex(ValueError, "overlap"):
-            self.prepare()
+        write_rows(self.source / "test.txt", test + [sample(bases[0], 999)])
+        manifest = self.prepare()
+        self.assertEqual(set(manifest["classes"]), set(bases + novels))
+        self.assertEqual(len(manifest["classes"]), 4)
+        counts = {row["class"]: row["source"] for row in manifest["class_counts"]}
+        self.assertEqual(counts[bases[0]], 6)
+        self.assertEqual(sum(manifest["splits"][key]["count"]
+                             for key in ("train_labeled", "validation", "test")), 21)
 
     def test_duplicates_conflicts_retained_and_other_filtered(self):
         _, _, train, _ = self.fixture(base_n=4)
@@ -218,7 +228,7 @@ class MREProtocolTests(unittest.TestCase):
         self.assertEqual(manifest["audit"]["conflicting_input_count"], 1)
         self.assertEqual(manifest["audit"]["conflicting_record_count"], 3)
         self.assertEqual(sum(manifest["splits"][key]["count"]
-                             for key in ("train_labeled", "validation", "test")), 11)
+                             for key in ("train_labeled", "validation", "test")), 18)
 
     def test_invalid_row_gives_source_line_and_does_not_execute(self):
         self.fixture()

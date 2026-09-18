@@ -1,9 +1,10 @@
-"""Prepare text-only MRE with fixed source-defined base/novel classes.
+"""Prepare text-only MRE with its default random-half base/novel classes.
 
 This is TRANSDUCTIVE: test inputs are the unlabeled training pool. Their
 ground-truth labels exist only in test.jsonl, never train_unlabeled.jsonl.
-The default 64/16 class split follows the user's protocol, while the sample
-fractions reproduce MRE_learn.data_loader.split_dataset.
+Read train.txt then test.txt, preserving first-appearance relation order.
+One NumPy RandomState first shuffles relations, then each base class's rows,
+matching MRE_learn.utils.split_types and data_loader.split_dataset.
 """
 
 import ast
@@ -16,7 +17,8 @@ import numpy as np
 
 
 FILTERED_RELATIONS = frozenset(("Other", "None", "none", "NA"))
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
+PROTOCOL = "mre_transductive_random_half"
 OUTPUT_FILES = {
     "train_labeled": "train_labeled.jsonl",
     "train_unlabeled": "train_unlabeled.jsonl",
@@ -198,7 +200,7 @@ def _audit(rows, split_records):
 
 
 def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
-                    expected_base=64, expected_novel=16):
+                    expected_total=80):
     """Write a new prepared directory and return its complete manifest dict.
 
     Existing output paths are always rejected, even with identical inputs;
@@ -212,27 +214,31 @@ def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
         raise ValueError("seed must be an integer")
     if not 0 <= seed <= 2 ** 32 - 1:
         raise ValueError("seed must be in [0, 2**32 - 1]")
-    if any(isinstance(n, bool) or not isinstance(n, int) or n < 1
-           for n in (expected_base, expected_novel)):
-        raise ValueError("expected class counts must be positive integers")
+    if isinstance(expected_total, bool) or not isinstance(expected_total, int) or expected_total < 2:
+        raise ValueError("expected_total must be an integer of at least 2")
     if position_format not in ("indices", "half_open"):
         raise ValueError("position_format must be 'indices' or 'half_open'")
-    base_rows, base_classes, train_info = _read_source(source_dir / "train.txt", position_format)
-    novel_rows, novel_classes, test_info = _read_source(source_dir / "test.txt", position_format)
-    overlap = sorted(set(base_classes) & set(novel_classes))
-    if overlap:
-        raise ValueError("source train/test class sets overlap: {}".format(overlap))
-    if len(base_classes) != expected_base or len(novel_classes) != expected_novel:
-        raise ValueError("expected {} base / {} novel classes; found {} / {}".format(
-            expected_base, expected_novel, len(base_classes), len(novel_classes)))
-    classes = base_classes + novel_classes
-    class_to_id = {name: i for i, name in enumerate(classes)}
+    train_rows, train_classes, train_info = _read_source(source_dir / "train.txt", position_format)
+    test_rows, test_classes, test_info = _read_source(source_dir / "test.txt", position_format)
+    all_rows = train_rows + test_rows
     grouped = defaultdict(list)
-    for row in base_rows + novel_rows:
+    for row in all_rows:
         grouped[row["relation"]].append(row)
+    # Original MRE builds a dict by first occurrence while reading train then
+    # test. Do NOT sort, treat file boundaries as labels, or reseed after this
+    # shuffle: each changes the per-seed class/sample assignment.
+    source_classes = list(grouped)
+    if len(source_classes) != expected_total:
+        raise ValueError("expected {} total relations after filtering; found {}".format(
+            expected_total, len(source_classes)))
+    rng = np.random.RandomState(seed)
+    classes = source_classes.copy()
+    rng.shuffle(classes)
+    n_base = len(classes) // 2
+    base_classes, novel_classes = classes[:n_base], classes[n_base:]
+    class_to_id = {name: i for i, name in enumerate(classes)}
     splits = {key: [] for key in OUTPUT_FILES}
     class_counts = []
-    rng = np.random.RandomState(seed)
 
     def labeled(row):
         return {"id": row["id"], "text": row["text"], "label": class_to_id[row["relation"]]}
@@ -266,12 +272,22 @@ def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
     ]
     manifest = {
         "schema_version": SCHEMA_VERSION,
-        "protocol": "mre_transductive_fixed_base_novel",
+        "protocol": PROTOCOL,
         "description": "Test inputs are used as unlabeled training data; their true labels "
                        "are reserved for evaluation. Validation IDs never enter training. "
                        "All base training records are labeled; no extra 10% label sampling.",
         "seed": seed,
-        "rng": "numpy.random.RandomState; shuffle each base class in fixed class order",
+        "rng": "numpy.random.RandomState(seed); shuffle relations once, then shuffle each "
+               "base class in that order with the SAME RNG, without reseeding",
+        "class_split": {
+            "strategy": "random_half",
+            "source_order": ["train.txt", "test.txt"],
+            "relations_before_shuffle": source_classes,
+            "source_train_classes": train_classes,
+            "source_test_classes": test_classes,
+            "base_count_rule": "len(relations) // 2",
+            "reference": "MRE_learn.utils.split_types + data_loader.split_dataset",
+        },
         "position_format": position_format,
         "blank_token_policy": "Keep original token positions for entity spans; omit blank strings "
                               "only when rendering the marked sentence. Retain records; reject "
@@ -288,7 +304,7 @@ def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
         "splits": {name: {"count": len(rows), "ids": [row["id"] for row in rows]}
                    for name, rows in splits.items()},
         "class_counts": class_counts,
-        "audit": _audit(base_rows + novel_rows, splits),
+        "audit": _audit(all_rows, splits),
     }
     manifest["audit"].update({
         "blank_token_count": train_info["blank_token_count"] + test_info["blank_token_count"],

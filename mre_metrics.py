@@ -13,7 +13,7 @@ def _integer_vector(values, name):
     return values
 
 
-def mre_accuracy(y_true, y_pred, n_base=64, n_total=80):
+def mre_accuracy(y_true, y_pred, n_base=40, n_total=80):
     """Use ONE global matching, then score base/novel ground-truth subsets.
 
     IDs must be in [0, n_total), with base true IDs in [0, n_base).

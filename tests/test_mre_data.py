@@ -42,12 +42,12 @@ def prepared(tmp_path):
                 "relation": relation, "img_id": "nonexistent.jpg"}
 
     for filename, class_sizes in (("train.txt", [("base_a", 10), ("base_b", 15)]),
-                                  ("test.txt", [("novel", 6)])):
+                                  ("test.txt", [("source_test_a", 6), ("source_test_b", 8)])):
         rows = [record(relation, "{}_{}".format(relation, i))
                 for relation, count in class_sizes for i in range(count)]
         (source / filename).write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
     output = tmp_path / "prepared"
-    prepare_dataset(source, output, expected_base=2, expected_novel=1)
+    prepare_dataset(source, output, expected_total=4)
     return output
 
 
@@ -69,15 +69,15 @@ def rewrite_split(prepared, name, edit):
 def test_loaders_preserve_unlabeled_boundary_and_evaluation_order(prepared):
     tokenizer = FakeTokenizer()
     data = MREData(prepared, tokenizer, max_length=12, eval_batch_size=7)
-    assert (data.n_base, data.n_total) == (2, 3)
+    assert (data.n_base, data.n_total) == (2, 4)
     assert len(tokenizer.calls) == 3  # test text reuses unlabeled tokenization
-    assert data.labeled_dataset.tensors[0].shape == (9, 12)
-    assert data.validation_dataset.tensors[0].shape == (3, 12)
-    assert data.test_dataset.tensors[0].shape == (19, 12)
+    assert data.labeled_dataset.tensors[0].shape == (5, 12)
+    assert data.validation_dataset.tensors[0].shape == (2, 12)
+    assert data.test_dataset.tensors[0].shape == (32, 12)
     assert all(set(row) == {"id", "text"} for row in data.unlabeled_records)
-    assert torch.equal(data.unlabeled_dataset.tensors[3], torch.full((19,), -1))
-    assert torch.equal(data.semi_dataset.tensors[3][:9], data.labeled_dataset.tensors[3])
-    assert torch.equal(data.semi_dataset.tensors[3][9:], torch.full((19,), -1))
+    assert torch.equal(data.unlabeled_dataset.tensors[3], torch.full((32,), -1))
+    assert torch.equal(data.semi_dataset.tensors[3][:5], data.labeled_dataset.tensors[3])
+    assert torch.equal(data.semi_dataset.tensors[3][5:], torch.full((32,), -1))
     assert data.semi_records == data.labeled_records + data.unlabeled_records
     for loader, dataset in ((data.test_loader, data.test_dataset),
                             (data.validation_loader, data.validation_dataset),
@@ -86,7 +86,7 @@ def test_loaders_preserve_unlabeled_boundary_and_evaluation_order(prepared):
         assert sum(len(batch[0]) for batch in batches) == len(dataset)
         for column in range(4):
             assert torch.equal(torch.cat([batch[column] for batch in batches]), dataset.tensors[column])
-    assert set(data.test_dataset.tensors[3].tolist()) == {0, 1, 2}
+    assert set(data.test_dataset.tensors[3].tolist()) == {0, 1, 2, 3}
     assert set(torch.cat([batch[3] for batch in data.labeled_loader]).tolist()) == {0, 1}
 
 
@@ -94,6 +94,19 @@ def test_missing_token_type_ids_get_zeros(prepared):
     data = MREData(prepared, FakeTokenizer(token_types=False), max_length=8)
     assert data.semi_dataset.tensors[2].shape[1] == 8
     assert not data.semi_dataset.tensors[2].any()
+
+
+def test_saved_fixed_protocol_manifest_remains_readable(prepared):
+    # Existing outputs keep their stored class order and rows, not a new shuffle.
+    before = MREData(prepared, FakeTokenizer(), seed=0)
+    manifest_path = prepared / "manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    manifest["protocol"] = "mre_transductive_fixed_base_novel"
+    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    after = MREData(prepared, FakeTokenizer(), seed=3)
+    assert after.manifest["classes"] == before.manifest["classes"]
+    for name in ("labeled_records", "unlabeled_records", "validation_records", "test_records"):
+        assert getattr(after, name) == getattr(before, name)
 
 
 def test_original_random_sampling_uses_global_torch_rng_without_class_balancing(prepared):

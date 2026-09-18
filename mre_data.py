@@ -1,4 +1,4 @@
-"""Torch data adapter for the fixed, text-only, transductive MRE protocol."""
+"""Text-only MRE data adapter; also reads immutable legacy fixed-class runs."""
 
 import hashlib
 import json
@@ -78,7 +78,8 @@ class MREData:
             if isinstance(value, bool) or not isinstance(value, int) or value < 1:
                 raise ValueError("{} must be a positive integer".format(name))
         self.manifest = json.loads((self.prepared_dir / "manifest.json").read_text(encoding="utf-8"))
-        if self.manifest.get("protocol") != "mre_transductive_fixed_base_novel":
+        protocol = self.manifest.get("protocol")
+        if protocol not in ("mre_transductive_random_half", "mre_transductive_fixed_base_novel"):
             raise ValueError("unsupported MRE data protocol")
         self.n_base = self.manifest["n_base"]
         self.n_total = self.manifest["n_total"]
@@ -88,6 +89,8 @@ class MREData:
                 or len(set(classes)) != len(classes) or self.manifest["classes"] != classes
                 or self.manifest["class_to_id"] != {name: index for index, name in enumerate(classes)}):
             raise ValueError("manifest class order or class count is inconsistent")
+        if protocol == "mre_transductive_random_half" and self.n_base != self.n_total // 2:
+            raise ValueError("random-half protocol requires floor(n_total / 2) base classes")
         self.labeled_records = _read_split(self.prepared_dir, self.manifest, "train_labeled", True, self.n_base)
         self.unlabeled_records = _read_split(self.prepared_dir, self.manifest, "train_unlabeled", False, self.n_total)
         self.validation_records = _read_split(self.prepared_dir, self.manifest, "validation", True, self.n_base)

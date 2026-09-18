@@ -6,7 +6,7 @@ SOURCE_DIR = Path('/home/zhoubaohang/FewRel')  # original train.txt / test.txt
 BERT_MODEL = Path('/home/zhoubaohang/jiangyipeng/LOOP/pretrained/bert-base-uncased')
 TOKENIZER = BERT_MODEL
 OUTPUT_ROOT = ROOT / 'outputs'
-EXPERIMENT_VARIANT = 'loop_mre_fewrel_gpt35_v2'
+EXPERIMENT_VARIANT = 'loop_mre_random40_gpt35_v3'
 
 # API key is requested invisibly on the first uncached call. Alternatively,
 # point this to a PRIVATE text file outside this Git repository.
@@ -44,4 +44,5 @@ RTR_PROB = 0.25
 NAME_CLUSTERS = True  # original post-training interpretation; never used by MRE metrics
 
 # Intentionally absent: known_cls_ratio / labeled_ratio. The original source
-# files define 64 base + 16 novel; the MRE sample protocol defines all labels.
+# files are pooled, then MRE randomly splits the 80 relations into 40 base
+# and 40 novel per seed. The MRE sample protocol defines all training labels.
