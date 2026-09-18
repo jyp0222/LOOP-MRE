@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv*/
+outputs/
+generated/
+pretrained/
+pretrain_model/
+.env
+.env.*
+*_api_key*
+api_key.txt
+llm_cache.jsonl
+llm_calls.jsonl
