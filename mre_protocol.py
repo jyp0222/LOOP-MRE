@@ -216,7 +216,7 @@ def _audit(rows, split_records):
 
 
 def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
-                    expected_total=80, source_files=("train.txt", "test.txt")):
+                    expected_total=80, source_files=("train.txt", "test.txt"), task_type="relation"):
     """Write a new prepared directory and return its complete manifest dict.
 
     Existing output paths are always rejected, even with identical inputs;
@@ -232,6 +232,10 @@ def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
         raise ValueError("seed must be in [0, 2**32 - 1]")
     if isinstance(expected_total, bool) or not isinstance(expected_total, int) or expected_total < 2:
         raise ValueError("expected_total must be an integer of at least 2")
+    if task_type not in ("relation", "entity_type"):
+        raise ValueError("task_type must be relation or entity_type")
+    if task_type == "entity_type" and position_format != "half_open":
+        raise ValueError("MET requires half_open character offsets")
     if position_format not in ("indices", "half_open"):
         raise ValueError("position_format must be 'indices' or 'half_open'")
     if (not isinstance(source_files, (list, tuple)) or not source_files
@@ -241,7 +245,11 @@ def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
         raise ValueError("source_files must be nonempty filenames with distinct stems")
     all_rows, source_classes_by_file, source_info = [], {}, {}
     for filename in source_files:
-        rows, relations, info = _read_source(source_dir / filename, position_format)
+        if task_type == "entity_type":
+            from met_adapter import read_met_source
+            rows, relations, info = read_met_source(source_dir / filename, FILTERED_RELATIONS)
+        else:
+            rows, relations, info = _read_source(source_dir / filename, position_format)
         all_rows.extend(rows)
         source_classes_by_file[Path(filename).stem] = relations
         source_info[Path(filename).stem] = info
@@ -334,6 +342,14 @@ def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
         "blank_token_count": sum(info["blank_token_count"] for info in source_info.values()),
         "records_with_blank_tokens": sum(info["records_with_blank_tokens"] for info in source_info.values()),
     })
+    if task_type == "entity_type":
+        from met_adapter import sentence_overlap_audit
+        manifest.update(task_type=task_type, position_unit="character",
+                        filtered_labels=sorted(FILTERED_RELATIONS),
+                        split_unit="entity annotation; sentences are not grouped")
+        manifest["blank_token_policy"] = "Validate character offsets before normalizing rendered whitespace"
+        manifest["audit"]["identity"] = "casefolded target Entity/marked-sentence text"
+        manifest["audit"]["sentence_overlap"] = sentence_overlap_audit(all_rows, splits)
     # Input/validation failures above create no output. Exclusive directory
     # creation also protects against an output appearing while preparing.
     output_dir.mkdir(parents=True, exist_ok=False)

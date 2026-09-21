@@ -8,7 +8,7 @@ import platform
 import subprocess
 
 import mre_config as defaults
-from mre_prompts import PROMPT_VERSION
+from mre_prompts import prompt_settings
 
 
 def experiment_config(args):
@@ -25,7 +25,7 @@ def experiment_config(args):
                   model=args.model, reasoning_effort=args.reasoning_effort,
                   api_base=defaults.API_BASE, max_output_tokens=defaults.MAX_OUTPUT_TOKENS,
                   naming_model=defaults.NAMING_MODEL_NAME, llm_snapshot_verified=False,
-                  prompt_version=PROMPT_VERSION,
+                  task_type=args.task_type, prompt_version=prompt_settings(args.task_type)[0],
                   checkpoint_selection='last_epoch', evaluation='test_kmeans',
                   request_timeout=defaults.REQUEST_TIMEOUT, max_retries=defaults.MAX_RETRIES,
                   max_requests=args.max_requests, max_queries_per_refresh=None)
@@ -57,11 +57,13 @@ def experiment_config(args):
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-dir', type=Path, default=defaults.SOURCE_DIR)
+    parser.add_argument('--task-type', choices=['relation', 'entity_type'],
+                        default=getattr(defaults, 'TASK_TYPE', 'relation'))
     parser.add_argument('--source-files', nargs='+',
                         default=getattr(defaults, 'SOURCE_FILES', ('train.txt', 'test.txt')),
                         help='ordered source files to pool before the discovery split')
     parser.add_argument('--expected-classes', type=int, default=getattr(defaults, 'EXPECTED_CLASSES', 80),
-                        help='expected relation count AFTER filtering None/Other/none/NA')
+                        help='expected class count AFTER filtering None/Other/none/NA')
     parser.add_argument('--position-format', choices=['indices', 'half_open'], default=defaults.POSITION_FORMAT)
     parser.add_argument('--experiment-variant', default=defaults.EXPERIMENT_VARIANT)
     parser.add_argument('--bert-model', type=Path, default=defaults.BERT_MODEL)
@@ -94,6 +96,7 @@ def create_client(args, run_dir=None):
         base_url=defaults.API_BASE, max_output_tokens=defaults.MAX_OUTPUT_TOKENS,
         timeout=defaults.REQUEST_TIMEOUT, max_retries=defaults.MAX_RETRIES,
         max_requests=args.max_requests,
+        task_type=args.task_type,
         cache_path=run_dir / 'llm_cache.jsonl' if run_dir else None,
         log_path=run_dir / 'llm_calls.jsonl' if run_dir else None,
     )
@@ -186,15 +189,20 @@ def main(argv=None):
         return
     if args.check_llm:
         client = create_client(args)
-        answer = client.choose_neighbor(
-            'Head: Alice. Tail: Paris. Sentence: Alice was born in Paris.',
-            ['Head: Bob. Tail: Rome. Sentence: Bob was born in Rome.',
-             'Head: Carol. Tail: London. Sentence: Carol works in London.'])
+        if args.task_type == 'entity_type':
+            query = 'Entity: Alice. Sentence: [ENTITY] Alice [/ENTITY] visited Paris.'
+            choices = ['Entity: Bob. Sentence: [ENTITY] Bob [/ENTITY] visited Rome.',
+                       'Entity: Paris. Sentence: Alice visited [ENTITY] Paris [/ENTITY].']
+        else:
+            query = 'Head: Alice. Tail: Paris. Sentence: Alice was born in Paris.'
+            choices = ['Head: Bob. Tail: Rome. Sentence: Bob was born in Rome.',
+                       'Head: Carol. Tail: London. Sentence: Carol works in London.']
+        answer = client.choose_neighbor(query, choices)
         if client.last_query_fallback:
             raise RuntimeError('API check failed: Choice 1 was only the upstream error fallback; no valid LLM answer')
         print('Requested model: {}; response model: {}; answer: Choice {}'.format(
             client.model, client.last_response_model, answer + 1))
-        print('Prompt version: {}'.format(PROMPT_VERSION))
+        print('Prompt version: {}'.format(prompt_settings(args.task_type)[0]))
         print('Provider snapshot provenance: UNVERIFIED (model field does not verify backend weights).')
         return
     config = experiment_config(args)
@@ -204,7 +212,8 @@ def main(argv=None):
         config['experiment_variant'], config['seed'], stamp)
     # prepare_dataset creates this unique run's immutable data directory.
     manifest = prepare_dataset(args.source_dir, run_dir / 'data', config['seed'], config['position_format'],
-                               expected_total=config['expected_classes'], source_files=config['source_files'])
+                               expected_total=config['expected_classes'], source_files=config['source_files'],
+                               task_type=config['task_type'])
     print('Run directory: {}'.format(run_dir), flush=True)
     print('MRE random-half classes: {} base / {} novel (seed={})'.format(
         manifest['n_base'], manifest['n_novel'], config['seed']))
@@ -252,7 +261,7 @@ def main(argv=None):
                 'http_attempts': client.requests_made, 'cache_hits': client.cache_hits,
                 'requested_model': client.model, 'reasoning_effort': client.reasoning_effort,
                 'naming_model': client.naming_model, 'fallback_count': client.fallback_count,
-                'prompt_version': PROMPT_VERSION,
+                'prompt_version': config['prompt_version'],
                 'response_models': sorted(client.response_models),
                 'model_mismatch_count': client.model_mismatch_count,
                 'snapshot_verified': False,

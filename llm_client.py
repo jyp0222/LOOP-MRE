@@ -31,7 +31,7 @@ import warnings
 from urllib.parse import urlparse
 
 import requests
-from mre_prompts import PROMPT_VERSION, NEIGHBOR_INSTRUCTIONS, NAMING_INSTRUCTIONS
+from mre_prompts import PROMPT_VERSION, NEIGHBOR_INSTRUCTIONS, NAMING_INSTRUCTIONS, prompt_settings
 
 
 SUPPORTED_MODELS = ("gpt-3.5-turbo-0301", "gpt-3.5-turbo", "gpt-3.5-turbo-0125", "gpt-3.5-turbo-1106")
@@ -72,7 +72,10 @@ class LLMClient:
         max_requests=None,
         base_url="https://api.openai.com/v1",
         naming_model="gpt-3.5-turbo",
+        task_type="relation",
     ):
+        self.task_type = task_type
+        self.prompt_version, self.neighbor_instructions, self.naming_instructions = prompt_settings(task_type)
         if model not in SUPPORTED_MODELS or naming_model not in SUPPORTED_MODELS:
             raise ValueError("model must be a supported GPT-3.5 Turbo model: {}".format(
                 ", ".join(SUPPORTED_MODELS)))
@@ -143,7 +146,7 @@ class LLMClient:
         self._check_text(query, "query")
         self._check_text_list(choices, "choices", count=2)
         prompt = (
-            NEIGHBOR_INSTRUCTIONS + "\n\nQuery: " + query
+            self.neighbor_instructions + "\n\nQuery: " + query
             + "\nChoice 1: " + choices[0] + "\nChoice 2: " + choices[1]
         )
         return self._query("choose_neighbor", [{"role": "user", "content": prompt}])["choice"]
@@ -152,7 +155,7 @@ class LLMClient:
         """Name the directed relation supported by the three cluster examples."""
         self._check_text_list(samples, "samples", count=3)
         prompt = (
-            NAMING_INSTRUCTIONS + "\n\nExample 1: " + samples[0]
+            self.naming_instructions + "\n\nExample 1: " + samples[0]
             + "\nExample 2: " + samples[1] + "\nExample 3: " + samples[2]
         )
         return self._query("name_cluster", [
@@ -206,7 +209,7 @@ class LLMClient:
                     key = entry["key"]
                     if not isinstance(key, str) or not re.fullmatch(r"[0-9a-f]{64}", key):
                         raise ValueError("bad key")
-                    if entry.get("version") != PROMPT_VERSION:
+                    if entry.get("version") != self.prompt_version:
                         continue
                     if not isinstance(entry["answer"], dict):
                         raise ValueError("bad answer")
@@ -249,7 +252,7 @@ class LLMClient:
             "time_utc": datetime.now(timezone.utc).isoformat(),
             "request_key": key,
             "task": task,
-            "prompt_version": PROMPT_VERSION,
+            "prompt_version": self.prompt_version,
             "status": status,
             "requested_model": requested_model,
             "reasoning_effort": self.reasoning_effort,
@@ -277,7 +280,7 @@ class LLMClient:
         # in the cache key; the default request retains upstream API defaults.
         if self.max_output_tokens is not None:
             payload["max_tokens"] = self.max_output_tokens
-        canonical = json.dumps({"version": PROMPT_VERSION, "endpoint": self.endpoint,
+        canonical = json.dumps({"version": self.prompt_version, "endpoint": self.endpoint,
                                 "payload": payload}, sort_keys=True, ensure_ascii=False,
                                separators=(",", ":"))
         key = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -314,7 +317,7 @@ class LLMClient:
         metadata = {"id": self._safe_identifier(response.get("id")),
                     "model": self._safe_identifier(response.get("model")),
                     "usage": self._safe_usage(response.get("usage"))}
-        entry = {"version": PROMPT_VERSION, "key": key, "answer": answer, "metadata": metadata}
+        entry = {"version": self.prompt_version, "key": key, "answer": answer, "metadata": metadata}
         self._append_jsonl(self.cache_path, entry)
         self._cache[key] = entry
         self._log(key, task, "completed", time.monotonic() - started, response, cache_hit=False)
