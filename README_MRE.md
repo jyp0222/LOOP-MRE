@@ -200,6 +200,8 @@ python -u run_mre.py --seed 0
 | llm_cache.jsonl | 成功回答的持久缓存；不保存 key 或请求原文 |
 | cluster_names.json | 训练后命名，不参与指标计算 |
 
+已有 GPT 运行可用 `python mre_neighbor_audit.py --run-dir outputs/某次有GPT的完整运行目录` 离线审计已记录的候选与选择。脚本兼容本分支随机 40/40 及旧固定 64/16 清单，只读取保存的训练/测试标签作事后诊断，不训练、不请求 API，也不改动原实验文件。它另建 `outputs/neighbor_audit_时间戳/` 保存 JSON 和可复制到表格的 `summary.txt`；指标含候选同类覆盖、GPT 在恰一同类候选时的选对率、同一对候选随机二选一期望及 Base/Novel 错边方向。定义和边界见 [README_NEIGHBOR_AUDIT.md](README_NEIGHBOR_AUDIT.md)。
+
 对新结果重新评估（不调用 API）：
 
 ```bash
