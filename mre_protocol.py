@@ -2,7 +2,8 @@
 
 This is TRANSDUCTIVE: test inputs are the unlabeled training pool. Their
 ground-truth labels exist only in test.jsonl, never train_unlabeled.jsonl.
-Read train.txt then test.txt, preserving first-appearance relation order.
+Read explicitly ordered source files, preserving first-appearance relation order.
+The FewRel default remains train.txt then test.txt.
 One NumPy RandomState first shuffles relations, then each base class's rows,
 matching MRE_learn.utils.split_types and data_loader.split_dataset.
 """
@@ -104,22 +105,34 @@ def format_relation_text(record, position_format="indices"):
 
 def _read_source(source_path, position_format):
     raw = source_path.read_bytes()
+    content = raw.decode("utf-8-sig")
+    is_array = content.lstrip().startswith("[")
+    if is_array:
+        try:
+            source_items = json.loads(content)
+        except json.JSONDecodeError as exc:
+            raise ValueError("{}: invalid JSON array".format(source_path.name)) from exc
+    else:
+        source_items = content.splitlines()
     rows, classes = [], []
     filtered = Counter()
     nonempty_lines = 0
     blank_token_count = 0
     records_with_blank_tokens = 0
     blank_token_examples = []
-    for line_number, line in enumerate(raw.decode("utf-8-sig").splitlines(), 1):
-        if not line.strip():
+    for line_number, line in enumerate(source_items, 1):
+        if not is_array and not line.strip():
             continue
         nonempty_lines += 1
         context = "{}:{}".format(source_path.name, line_number)
         try:
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                record = ast.literal_eval(line)
+            if is_array:
+                record = line
+            else:
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    record = ast.literal_eval(line)
             if not isinstance(record, dict):
                 raise ValueError("each input row must be a dictionary")
             relation = record.get("relation")
@@ -157,6 +170,9 @@ def _read_source(source_path, position_format):
         "records_with_blank_tokens": records_with_blank_tokens,
         "blank_token_examples": blank_token_examples,
     }
+    if is_array:
+        metadata["record_format"] = "json_array"
+        metadata["id_index"] = "one-based array element, not physical line"
     return rows, classes, metadata
 
 
@@ -200,7 +216,7 @@ def _audit(rows, split_records):
 
 
 def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
-                    expected_total=80):
+                    expected_total=80, source_files=("train.txt", "test.txt")):
     """Write a new prepared directory and return its complete manifest dict.
 
     Existing output paths are always rejected, even with identical inputs;
@@ -218,9 +234,17 @@ def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
         raise ValueError("expected_total must be an integer of at least 2")
     if position_format not in ("indices", "half_open"):
         raise ValueError("position_format must be 'indices' or 'half_open'")
-    train_rows, train_classes, train_info = _read_source(source_dir / "train.txt", position_format)
-    test_rows, test_classes, test_info = _read_source(source_dir / "test.txt", position_format)
-    all_rows = train_rows + test_rows
+    if (not isinstance(source_files, (list, tuple)) or not source_files
+            or any(not isinstance(name, str) or not name or Path(name).name != name
+                   or "/" in name or "\\" in name or name in (".", "..") for name in source_files)
+            or len({Path(name).stem for name in source_files}) != len(source_files)):
+        raise ValueError("source_files must be nonempty filenames with distinct stems")
+    all_rows, source_classes_by_file, source_info = [], {}, {}
+    for filename in source_files:
+        rows, relations, info = _read_source(source_dir / filename, position_format)
+        all_rows.extend(rows)
+        source_classes_by_file[Path(filename).stem] = relations
+        source_info[Path(filename).stem] = info
     grouped = defaultdict(list)
     for row in all_rows:
         grouped[row["relation"]].append(row)
@@ -281,10 +305,10 @@ def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
                "base class in that order with the SAME RNG, without reseeding",
         "class_split": {
             "strategy": "random_half",
-            "source_order": ["train.txt", "test.txt"],
+            "source_order": list(source_files),
             "relations_before_shuffle": source_classes,
-            "source_train_classes": train_classes,
-            "source_test_classes": test_classes,
+            **{"source_{}_classes".format(name): relations
+               for name, relations in source_classes_by_file.items()},
             "base_count_rule": "len(relations) // 2",
             "reference": "MRE_learn.utils.split_types + data_loader.split_dataset",
         },
@@ -299,7 +323,7 @@ def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
         "n_base": len(base_classes),
         "n_novel": len(novel_classes),
         "n_total": len(classes),
-        "sources": {"train": train_info, "test": test_info},
+        "sources": source_info,
         "files": dict(OUTPUT_FILES),
         "splits": {name: {"count": len(rows), "ids": [row["id"] for row in rows]}
                    for name, rows in splits.items()},
@@ -307,9 +331,8 @@ def prepare_dataset(source_dir, output_dir, seed=0, position_format="indices",
         "audit": _audit(all_rows, splits),
     }
     manifest["audit"].update({
-        "blank_token_count": train_info["blank_token_count"] + test_info["blank_token_count"],
-        "records_with_blank_tokens": (train_info["records_with_blank_tokens"]
-                                      + test_info["records_with_blank_tokens"]),
+        "blank_token_count": sum(info["blank_token_count"] for info in source_info.values()),
+        "records_with_blank_tokens": sum(info["records_with_blank_tokens"] for info in source_info.values()),
     })
     # Input/validation failures above create no output. Exclusive directory
     # creation also protects against an output appearing while preparing.

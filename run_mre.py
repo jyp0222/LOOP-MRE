@@ -19,6 +19,8 @@ def experiment_config(args):
              'view_strategy', 'rtr_prob', 'experiment_variant')
     config = {name: getattr(defaults, name.upper()) for name in names}
     config.update(seed=args.seed, source_dir=str(args.source_dir), bert_model=str(args.bert_model),
+                  source_files=list(args.source_files), expected_classes=args.expected_classes,
+                  position_format=args.position_format, experiment_variant=args.experiment_variant,
                   tokenizer=str(args.tokenizer), llm_enabled=not args.no_llm,
                   model=args.model, reasoning_effort=args.reasoning_effort,
                   api_base=defaults.API_BASE, max_output_tokens=defaults.MAX_OUTPUT_TOKENS,
@@ -55,6 +57,13 @@ def experiment_config(args):
 def build_parser():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--source-dir', type=Path, default=defaults.SOURCE_DIR)
+    parser.add_argument('--source-files', nargs='+',
+                        default=getattr(defaults, 'SOURCE_FILES', ('train.txt', 'test.txt')),
+                        help='ordered source files to pool before the discovery split')
+    parser.add_argument('--expected-classes', type=int, default=getattr(defaults, 'EXPECTED_CLASSES', 80),
+                        help='expected relation count AFTER filtering None/Other/none/NA')
+    parser.add_argument('--position-format', choices=['indices', 'half_open'], default=defaults.POSITION_FORMAT)
+    parser.add_argument('--experiment-variant', default=defaults.EXPERIMENT_VARIANT)
     parser.add_argument('--bert-model', type=Path, default=defaults.BERT_MODEL)
     parser.add_argument('--tokenizer', type=Path, default=defaults.TOKENIZER)
     parser.add_argument('--output-root', type=Path, default=defaults.OUTPUT_ROOT)
@@ -194,13 +203,17 @@ def main(argv=None):
     run_dir = args.output_root.resolve() / '{}_seed{}_{}'.format(
         config['experiment_variant'], config['seed'], stamp)
     # prepare_dataset creates this unique run's immutable data directory.
-    manifest = prepare_dataset(args.source_dir, run_dir / 'data', config['seed'], config['position_format'])
+    manifest = prepare_dataset(args.source_dir, run_dir / 'data', config['seed'], config['position_format'],
+                               expected_total=config['expected_classes'], source_files=config['source_files'])
     print('Run directory: {}'.format(run_dir), flush=True)
     print('MRE random-half classes: {} base / {} novel (seed={})'.format(
         manifest['n_base'], manifest['n_novel'], config['seed']))
     print('Base:', manifest['base_classes'])
     print('Novel:', manifest['novel_classes'])
     print('Split counts: {}'.format({name: split['count'] for name, split in manifest['splits'].items()}))
+    print('Source audit: {}'.format({name: {key: info[key] for key in
+          ('retained_records', 'filtered_records', 'filtered_relations')}
+          for name, info in manifest['sources'].items()}), flush=True)
     print('Data audit: {}'.format(manifest['audit']), flush=True)
     print('Experiment variant: {}; k={}; batch={}/{}/{}; view={}; last-epoch selection; test KMeans'.format(
         config['experiment_variant'], config['topk'], config['labeled_batch_size'],
