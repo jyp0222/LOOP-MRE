@@ -29,6 +29,9 @@ def experiment_config(args):
                   checkpoint_selection='last_epoch', evaluation='test_kmeans',
                   request_timeout=defaults.REQUEST_TIMEOUT, max_retries=defaults.MAX_RETRIES,
                   max_requests=args.max_requests, max_queries_per_refresh=None)
+    config.update(use_image_caption=args.use_image_caption,
+                  caption_path=str(args.caption_path) if args.caption_path else None,
+                  caption_model=args.caption_model, caption_image_field=args.caption_image_field)
     if args.smoke:
         # Keep the normal ranking pools. Cap actual eligible anchors AFTER
         # intersection; top-5 vs top-5 can have an empty intersection.
@@ -77,6 +80,15 @@ def build_parser():
     parser.add_argument('--api-key-file', type=Path, default=defaults.API_KEY_FILE)
     parser.add_argument('--max-requests', type=int, default=defaults.MAX_REQUESTS)
     parser.add_argument('--no-llm', action='store_true', help='same-protocol baseline, zero API calls')
+    captions = parser.add_mutually_exclusive_group()
+    captions.add_argument('--use-image-caption', '--use_image_caption', action='store_true',
+                          default=getattr(defaults, 'USE_IMAGE_CAPTION', False))
+    captions.add_argument('--no-image-caption', dest='use_image_caption', action='store_false')
+    parser.add_argument('--caption-path', '--caption_path', type=Path,
+                        default=getattr(defaults, 'CAPTION_PATH', None))
+    parser.add_argument('--caption-model', '--caption_model',
+                        default=getattr(defaults, 'CAPTION_MODEL', 'Salesforce/blip-image-captioning-base'))
+    parser.add_argument('--caption-image-field', default=getattr(defaults, 'CAPTION_IMAGE_FIELD', 'img_id'))
     parser.add_argument('--smoke', action='store_true', help='2+2 epochs; at most 5 queried anchors per refresh')
     parser.add_argument('--name-clusters', action='store_true', help='extra paid naming calls after final metrics')
     parser.add_argument('--no-name-clusters', action='store_true', help='skip the optional post-test naming calls')
@@ -132,17 +144,21 @@ def load_data(config, run_dir, tokenizer_path=None):
         raise ValueError('Dataset manifest does not match this experiment config')
     from transformers import AutoTokenizer
     from mre_data import MREData
+    from mre_captions import load_caption_texts, truncation_stats
+    captions = load_caption_texts(config, run_dir)
     tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path or config['tokenizer']), local_files_only=True)
     data = MREData(run_dir / 'data', tokenizer, max_length=config['max_length'],
                    labeled_batch_size=config['labeled_batch_size'], train_batch_size=config['train_batch_size'],
-                   eval_batch_size=config['eval_batch_size'], seed=config['seed'])
-    # Both BERT and GPT now use the tokenizer-visible, truncated input.
+                   eval_batch_size=config['eval_batch_size'], seed=config['seed'], caption_records=captions)
+    # Caption affects BERT only. GPT retains the baseline original tokenized text.
     truncation = {}
     for name, rows in (('train_labeled', data.labeled_records), ('train_unlabeled', data.unlabeled_records),
                        ('validation', data.validation_records)):
-        lengths = [len(tokenizer.encode(row['text'], truncation=False)) for row in rows]
-        truncation[name] = {'total': len(rows), 'truncated': sum(n > config['max_length'] for n in lengths),
-                            'maximum_tokens_before_truncation': max(lengths)}
+        truncation[name] = truncation_stats(tokenizer, rows, config['max_length'], captions)
+    if captions is not None:
+        truncation['test'] = dict(truncation['train_unlabeled'])
+        truncation['unique_samples'] = truncation_stats(tokenizer,
+            data.semi_records + data.validation_records, config['max_length'], captions)
     (run_dir / 'tokenization_audit.json').write_text(json.dumps(truncation, indent=2) + '\n', encoding='utf-8')
     print('Tokenization audit: {}'.format(truncation), flush=True)
     return tokenizer, data
@@ -227,6 +243,8 @@ def main(argv=None):
     print('Experiment variant: {}; k={}; batch={}/{}/{}; view={}; last-epoch selection; test KMeans'.format(
         config['experiment_variant'], config['topk'], config['labeled_batch_size'],
         config['train_batch_size'], config['eval_batch_size'], config['view_strategy']), flush=True)
+    from mre_captions import snapshot_inputs
+    snapshot_inputs(config, run_dir, manifest)
     client = None
     if not (args.no_llm or args.prepare_only or args.check_data):
         client = create_client(args, run_dir)

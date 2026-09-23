@@ -103,7 +103,7 @@ def format_relation_text(record, position_format="indices"):
     return "Head: {}. Tail: {}. Sentence: {}".format(hn, tn, " ".join(marked))
 
 
-def _read_source(source_path, position_format):
+def _read_source(source_path, position_format, image_records=None, image_field="img_id"):
     raw = source_path.read_bytes()
     content = raw.decode("utf-8-sig")
     is_array = content.lstrip().startswith("[")
@@ -158,6 +158,10 @@ def _read_source(source_path, position_format):
             "text": text,
             "relation": relation,
         })
+        # Optional side channel for offline captioning. Never affects row text,
+        # class order, filtering, RNG, or the existing prepared split schema.
+        if image_records is not None:
+            image_records[rows[-1]["id"]] = record.get(image_field)
     metadata = {
         "file": source_path.name,
         "sha256": hashlib.sha256(raw).hexdigest(),

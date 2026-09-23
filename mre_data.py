@@ -71,7 +71,8 @@ class MREData:
     """
 
     def __init__(self, prepared_dir, tokenizer, max_length=128,
-                 labeled_batch_size=64, train_batch_size=128, eval_batch_size=64, seed=0):
+                 labeled_batch_size=64, train_batch_size=128, eval_batch_size=64, seed=0,
+                 caption_records=None):
         self.prepared_dir = Path(prepared_dir)
         for name, value in (("max_length", max_length), ("labeled_batch_size", labeled_batch_size),
                             ("train_batch_size", train_batch_size), ("eval_batch_size", eval_batch_size)):
@@ -109,9 +110,27 @@ class MREData:
                 raise ValueError("{} records do not cover all expected classes".format(name))
 
         self.semi_records = self.labeled_records + self.unlabeled_records
-        self.labeled_dataset = _tensor_dataset(self.labeled_records, tokenizer, max_length, True)
-        self.unlabeled_dataset = _tensor_dataset(self.unlabeled_records, tokenizer, max_length, False)
-        self.validation_dataset = _tensor_dataset(self.validation_records, tokenizer, max_length, True)
+        def encoder_rows(records):
+            if caption_records is None:
+                return records
+            return [dict(row, text=caption_records[row['id']]['text']) for row in records]
+
+        if caption_records is not None:
+            from mre_captions import SUFFIX, validate_caption
+            all_rows = self.semi_records + self.validation_records
+            if set(caption_records) != {row['id'] for row in all_rows}:
+                raise ValueError('Caption sample IDs differ from prepared dataset')
+            for row in all_rows:
+                saved = caption_records[row['id']]
+                if (saved['original_text'] != row['text'] or
+                        saved['text'] != row['text'] + SUFFIX + validate_caption(saved['caption'])):
+                    raise ValueError('Caption original/augmented text mismatch: {}'.format(row['id']))
+            # The LLM keeps exactly the baseline truncated/decoded original input.
+            # Sampling and query logic remain untouched; only encoder input changes.
+            self.llm_input_ids = _tensor_dataset(self.semi_records, tokenizer, max_length, False).tensors[0]
+        self.labeled_dataset = _tensor_dataset(encoder_rows(self.labeled_records), tokenizer, max_length, True)
+        self.unlabeled_dataset = _tensor_dataset(encoder_rows(self.unlabeled_records), tokenizer, max_length, False)
+        self.validation_dataset = _tensor_dataset(encoder_rows(self.validation_records), tokenizer, max_length, True)
         # Test and unlabeled inputs are identical; share their tensors to avoid
         # duplicate tokenization. Only this evaluation dataset gets true labels.
         self.test_dataset = TensorDataset(

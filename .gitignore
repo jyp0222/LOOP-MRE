@@ -12,3 +12,4 @@ pretrain_model/
 api_key.txt
 llm_cache.jsonl
 llm_calls.jsonl
+caption_cache/

@@ -109,7 +109,8 @@ class NeighborPairs(Dataset):
             if index not in self.decisions:
                 choices = [q1, q2]
                 def decode(i):
-                    return self.tokenizer.decode(self.data.semi_dataset[i][0],
+                    return self.tokenizer.decode(self.data.llm_input_ids[i] if hasattr(self.data, 'llm_input_ids')
+                                                 else self.data.semi_dataset[i][0],
                         skip_special_tokens=True, clean_up_tokenization_spaces=True)
                 answer = self.client.choose_neighbor(
                     decode(index), [decode(i) for i in choices])
@@ -333,7 +334,8 @@ class MRETrainer:
         _, nearest_rows = torch.sort(distances, dim=1)
         names = {}
         for cluster, nearest in zip(novel, nearest_rows[:, :3]):
-            samples = [self.tokenizer.decode(self.data.semi_dataset[int(i)][0], skip_special_tokens=True,
+            samples = [self.tokenizer.decode(self.data.llm_input_ids[int(i)] if hasattr(self.data, 'llm_input_ids')
+                                            else self.data.semi_dataset[int(i)][0], skip_special_tokens=True,
                                             clean_up_tokenization_spaces=True) for i in nearest]
             try:
                 names[str(cluster)] = self.client.name_cluster(samples)
