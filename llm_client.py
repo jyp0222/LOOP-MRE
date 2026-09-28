@@ -31,7 +31,7 @@ import warnings
 from urllib.parse import urlparse
 
 import requests
-from mre_prompts import PROMPT_VERSION, NEIGHBOR_INSTRUCTIONS, NAMING_INSTRUCTIONS, prompt_settings
+from mre_prompts import prompt_settings
 
 
 SUPPORTED_MODELS = ("gpt-3.5-turbo-0301", "gpt-3.5-turbo", "gpt-3.5-turbo-0125", "gpt-3.5-turbo-1106")
@@ -74,12 +74,10 @@ class LLMClient:
         naming_model="gpt-3.5-turbo",
         task_type="relation",
         temperature=0.0,
-        relation_prompt="current",
     ):
         self.task_type = task_type
-        self.relation_prompt = relation_prompt
-        self.prompt_version, self.neighbor_instructions, self.naming_instructions = prompt_settings(
-            task_type, relation_prompt)
+        self.relation_prompt = "current"  # Retain the audit field for existing result tools.
+        self.prompt_version, self.neighbor_instructions, self.naming_instructions = prompt_settings(task_type)
         if temperature is not None:
             if (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
                     or not math.isfinite(temperature) or not 0 <= temperature <= 2):

@@ -40,9 +40,9 @@ def experiment_config(args):
                   api_base=defaults.API_BASE, max_output_tokens=defaults.MAX_OUTPUT_TOKENS,
                   naming_model=defaults.NAMING_MODEL_NAME, llm_snapshot_verified=False,
                   llm_temperature=parse_llm_temperature(args.llm_temperature),
-                  relation_prompt=args.relation_prompt,
+                  relation_prompt='current',
                   task_type=args.task_type,
-                  prompt_version=prompt_settings(args.task_type, args.relation_prompt)[0],
+                  prompt_version=prompt_settings(args.task_type)[0],
                   checkpoint_selection='last_epoch', evaluation='test_kmeans',
                   request_timeout=defaults.REQUEST_TIMEOUT, max_retries=defaults.MAX_RETRIES,
                   max_requests=args.max_requests, max_queries_per_refresh=None)
@@ -98,9 +98,6 @@ def build_parser():
     parser.add_argument('--llm-temperature', type=parse_llm_temperature,
                         default=getattr(defaults, 'LLM_TEMPERATURE', 0.0),
                         help='GPT sampling temperature, default 0; provider omits it (not RNCL temperature)')
-    parser.add_argument('--relation-prompt', choices=['current', 'mre-v2'],
-                        default=getattr(defaults, 'RELATION_PROMPT', 'current'),
-                        help='current preserves existing prompt text; mre-v2 selects the MRE social-media prompt')
     parser.add_argument('--max-requests', type=int, default=defaults.MAX_REQUESTS)
     parser.add_argument('--no-llm', action='store_true', help='same-protocol baseline, zero API calls')
     captions = parser.add_mutually_exclusive_group()
@@ -132,7 +129,7 @@ def create_client(args, run_dir=None):
         timeout=defaults.REQUEST_TIMEOUT, max_retries=defaults.MAX_RETRIES,
         max_requests=args.max_requests,
         task_type=args.task_type,
-        temperature=parse_llm_temperature(args.llm_temperature), relation_prompt=args.relation_prompt,
+        temperature=parse_llm_temperature(args.llm_temperature),
         cache_path=run_dir / 'llm_cache.jsonl' if run_dir else None,
         log_path=run_dir / 'llm_calls.jsonl' if run_dir else None,
     )
@@ -242,7 +239,7 @@ def main(argv=None):
             raise RuntimeError('API check failed: Choice 1 was only the upstream error fallback; no valid LLM answer')
         print('Requested model: {}; response model: {}; answer: Choice {}'.format(
             client.model, client.last_response_model, answer + 1))
-        print('Prompt version: {}'.format(prompt_settings(args.task_type, args.relation_prompt)[0]))
+        print('Prompt version: {}'.format(prompt_settings(args.task_type)[0]))
         print('LLM temperature: {}'.format(parse_llm_temperature(args.llm_temperature)))
         print('Provider snapshot provenance: UNVERIFIED (model field does not verify backend weights).')
         return

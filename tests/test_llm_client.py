@@ -293,35 +293,23 @@ def test_temperature_caches_are_isolated_and_reusable_without_network(monkeypatc
         assert changed.cache_hits == 0
 
 
-def test_current_prompt_is_unchanged_and_mre_v2_cache_cannot_replace_it(monkeypatch, tmp_path):
+def test_current_prompt_is_unchanged():
     current = LLMClient(api_key=KEY)
     baseline_text = '\n'.join((current.prompt_version, current.neighbor_instructions,
                                 current.naming_instructions))
-    # Frozen before this ablation: guarantees --relation-prompt current preserves
+    # Frozen before this ablation: guarantees the retained current prompt preserves
     # all legacy instruction text, not merely a version label.
     assert hashlib.sha256(baseline_text.encode()).hexdigest() == (
         '1262610bdc8e0ffefe396f789eb9aa13cf33803155b65720b07aa46a2fba244e')
-    cache = tmp_path / 'cache.jsonl'
-    calls = stub(monkeypatch)
-    for prompt in ('current', 'mre-v2'):
-        LLMClient(api_key=KEY, cache_path=cache, relation_prompt=prompt).choose_neighbor(QUERY, CHOICES)
-    assert len(calls) == 2
-    assert calls[0][1]['json']['messages'] != calls[1][1]['json']['messages']
-    for prompt in ('current', 'mre-v2'):
-        replay = LLMClient(cache_path=cache, relation_prompt=prompt, max_requests=0)
-        assert replay.choose_neighbor(QUERY, CHOICES) == 1
-        assert replay.cache_hits == 1 and replay.requests_made == 0
 
 
-def test_entity_typing_keeps_met_prompt_and_rejects_relation_prompt(monkeypatch):
+def test_entity_typing_keeps_met_prompt(monkeypatch):
     from mre_prompts import MET_PROMPT_VERSION, MET_NEIGHBOR_INSTRUCTIONS
     calls = stub(monkeypatch)
     client = LLMClient(api_key=KEY, task_type='entity_type')
     client.choose_neighbor(QUERY, CHOICES)
     assert client.prompt_version == MET_PROMPT_VERSION
     assert calls[0][1]['json']['messages'][0]['content'].startswith(MET_NEIGHBOR_INSTRUCTIONS)
-    with pytest.raises(ValueError, match='task_type=relation'):
-        LLMClient(task_type='entity_type', relation_prompt='mre-v2')
 
 
 @pytest.mark.parametrize('temperature', [-0.1, 2.1, True, False, '0', float('nan'), float('inf'), -float('inf')])

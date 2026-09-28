@@ -125,26 +125,37 @@ def test_prepare_only_records_new_protocol_and_prints_class_lists(tmp_path, monk
 
 
 @pytest.mark.parametrize('option,expected', [('0', 0.0), ('0.5', 0.5), ('2', 2.0), ('provider', None)])
-@pytest.mark.parametrize('prompt', ['current', 'mre-v2'])
-def test_runner_temperature_and_prompt_reach_config_and_client(option, expected, prompt):
-    args = run_mre.build_parser().parse_args(['--llm-temperature', option, '--relation-prompt', prompt])
+def test_runner_temperature_reaches_config_and_client(option, expected):
+    args = run_mre.build_parser().parse_args(['--llm-temperature', option])
     config = run_mre.experiment_config(args)
     client = run_mre.create_client(args)
     assert config['llm_temperature'] == client.temperature == expected
-    assert config['relation_prompt'] == client.relation_prompt == prompt
+    assert config['relation_prompt'] == client.relation_prompt == 'current'
     assert config['prompt_version'] == client.prompt_version
     assert config['temperature'] == 0.07  # RNCL still uses its independent temperature.
     assert config['llm_enabled'] is True
 
 
-def test_runner_can_set_temperature_and_prompt_in_python_config(monkeypatch):
+def test_runner_can_set_temperature_in_python_config(monkeypatch):
     monkeypatch.setattr(run_mre.defaults, 'LLM_TEMPERATURE', None, raising=False)
-    monkeypatch.setattr(run_mre.defaults, 'RELATION_PROMPT', 'mre-v2', raising=False)
     args = run_mre.build_parser().parse_args([])
     config, client = run_mre.experiment_config(args), run_mre.create_client(args)
     assert config['llm_temperature'] is client.temperature is None
-    assert config['relation_prompt'] == client.relation_prompt == 'mre-v2'
+    assert config['relation_prompt'] == client.relation_prompt == 'current'
     assert config['temperature'] == 0.07
+
+
+def test_server_current_prompt_constants_reach_client_and_metadata(monkeypatch):
+    """Servers may keep a different current prompt without changing the runner."""
+    import mre_prompts
+    monkeypatch.setattr(mre_prompts, 'PROMPT_VERSION', 'server-current-version')
+    monkeypatch.setattr(mre_prompts, 'NEIGHBOR_INSTRUCTIONS', 'Server neighbor instructions')
+    monkeypatch.setattr(mre_prompts, 'NAMING_INSTRUCTIONS', 'Server naming instructions')
+    args = run_mre.build_parser().parse_args([])
+    config, client = run_mre.experiment_config(args), run_mre.create_client(args)
+    assert config['prompt_version'] == client.prompt_version == 'server-current-version'
+    assert client.neighbor_instructions == 'Server neighbor instructions'
+    assert client.naming_instructions == 'Server naming instructions'
 
 
 @pytest.mark.parametrize('option', ['-1', '2.01', 'nan', 'inf', 'True', 'bad'])
@@ -158,7 +169,7 @@ def test_no_llm_switch_retains_baseline_training_settings():
     parser = run_mre.build_parser()
     baseline = run_mre.experiment_config(parser.parse_args(['--no-llm']))
     changed = run_mre.experiment_config(parser.parse_args([
-        '--no-llm', '--llm-temperature', 'provider', '--relation-prompt', 'mre-v2']))
+        '--no-llm', '--llm-temperature', 'provider']))
     assert changed['llm_enabled'] is changed['name_clusters'] is False
     changed.pop('llm_temperature')
     changed.pop('relation_prompt')
@@ -198,14 +209,14 @@ def test_runner_records_settings_and_skips_client_when_disabled(tmp_path, monkey
         monkeypatch.setattr(run_mre, 'create_client', forbidden)
     outputs = tmp_path / 'outputs'
     arguments = ['--output-root', str(outputs), '--bert-model', str(tmp_path),
-                 '--relation-prompt', 'mre-v2', '--llm-temperature', '0']
+                 '--llm-temperature', '0']
     if no_llm:
         arguments.append('--no-llm')
     run_mre.main(arguments)
     run = next(outputs.iterdir())
     config = json.loads((run / 'config.json').read_text())
     assert config['llm_temperature'] == 0.0 and config['temperature'] == 0.07
-    assert config['relation_prompt'] == 'mre-v2'
+    assert config['relation_prompt'] == 'current'
     assert config['llm_enabled'] is (not no_llm)
     if no_llm:
         assert received == [None]
@@ -213,6 +224,6 @@ def test_runner_records_settings_and_skips_client_when_disabled(tmp_path, monkey
     else:
         summary = json.loads((run / 'llm_summary.json').read_text())
         assert summary['llm_temperature'] == 0.0
-        assert summary['relation_prompt'] == 'mre-v2'
+        assert summary['relation_prompt'] == 'current'
         assert summary['prompt_version'] == config['prompt_version'] == received[0].prompt_version
         assert summary['http_attempts'] == 0 and summary['fallback_count'] == 0
