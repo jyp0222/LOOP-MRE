@@ -76,9 +76,18 @@ def score_loader(model, loader, centers, device, n_base, n_total):
     return mre_accuracy(labels, predictions, n_base, n_total), predictions
 
 
-def cluster_score_loader(model, loader, device, n_base, n_total, seed, n_init):
+def cluster_score_loader(model, loader, device, n_base, n_total, seed, n_init, image_features=None):
     """Fit KMeans on test features; ground-truth labels are used only to score."""
     features = extract_features(model, loader, device)
+    if image_features is not None:
+        from torch.utils.data import SequentialSampler
+        from mre_image_features import fuse_features
+        if not isinstance(loader.sampler, SequentialSampler):
+            raise ValueError('Final visual fusion requires a sequential test loader for image alignment')
+        text_shape, image_shape = features.shape, image_features.shape
+        features = fuse_features(features, image_features)
+        print('Final clustering feature shapes: text={}, image={}, fused={}'.format(
+            text_shape, image_shape, features.shape), flush=True)
     km = KMeans(n_clusters=n_total, random_state=seed, n_init=n_init).fit(features)
     labels = loader.dataset.tensors[3].numpy()
     return (mre_accuracy(labels, km.labels_, n_base, n_total), km.labels_,
@@ -281,8 +290,17 @@ class MRETrainer:
         self.model.save_backbone(self.run_dir / 'backbone')
         self.tokenizer.save_pretrained(self.run_dir / 'tokenizer')
         self.model.backbone.config.save_pretrained(self.run_dir / 'tokenizer')
+        # Experiment 1B changes only this final call. Intermediate reporting,
+        # graph KMeans/LIS/LLM, RNCL and post-test naming keep text-only features.
+        fusion = {'image_features': data.final_image_features} if cfg.get('use_image_feature') else {}
         metrics, predictions, self.centers = cluster_score_loader(self.model, data.test_loader, self.device,
-            data.n_base, data.n_total, cfg['seed'], cfg['kmeans_n_init'])
+            data.n_base, data.n_total, cfg['seed'], cfg['kmeans_n_init'], **fusion)
+        if cfg.get('use_image_feature'):
+            write_json(self.run_dir / 'final_feature_shapes.json', {
+                'text': [len(predictions), self.model.backbone.config.hidden_size],
+                'image': list(data.final_image_features.shape),
+                'fused': [len(predictions), int(self.centers.shape[1])],
+                'scope': 'final_test_kmeans_only', 'extra_trainable_parameters': 0})
         torch.save({'model_state': cpu_state(self.model), 'centers': torch.from_numpy(self.centers),
                     'epoch': cfg['train_epochs'], 'selection': 'last_epoch', 'evaluation': 'test_kmeans',
                     'n_base': data.n_base, 'n_total': data.n_total}, self.run_dir / 'last_model.pt')

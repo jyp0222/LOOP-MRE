@@ -49,6 +49,19 @@ def experiment_config(args):
     config.update(use_image_caption=args.use_image_caption,
                   caption_path=str(args.caption_path) if args.caption_path else None,
                   caption_model=args.caption_model, caption_image_field=args.caption_image_field)
+    config.update(use_image_feature=args.use_image_feature, image_encoder=args.image_encoder,
+                  image_model_path=str(args.image_model_path), freeze_image_encoder=args.freeze_image_encoder,
+                  image_feature_cache=str(args.image_feature_cache) if args.image_feature_cache else None,
+                  image_root=str(args.image_root) if args.image_root else None, image_field=args.image_field)
+    if config['use_image_feature']:
+        if config['use_image_caption']:
+            raise ValueError('Experiment 1B cannot be combined with image caption; use --no-image-caption')
+        if config['freeze_image_encoder'] is not True:
+            raise ValueError('Experiment 1B only supports a frozen image encoder')
+        if config['task_type'] != 'relation' or config['image_encoder'] != 'vit':
+            raise ValueError('Experiment 1B supports MRE relations with ViT only')
+        if not config['image_feature_cache']:
+            raise ValueError('--use-image-feature requires --image-feature-cache (offline preprocessing)')
     if args.smoke:
         # Keep the normal ranking pools. Cap actual eligible anchors AFTER
         # intersection; top-5 vs top-5 can have an empty intersection.
@@ -109,6 +122,22 @@ def build_parser():
     parser.add_argument('--caption-model', '--caption_model',
                         default=getattr(defaults, 'CAPTION_MODEL', 'Salesforce/blip-image-captioning-base'))
     parser.add_argument('--caption-image-field', default=getattr(defaults, 'CAPTION_IMAGE_FIELD', 'img_id'))
+    images = parser.add_mutually_exclusive_group()
+    images.add_argument('--use-image-feature', '--use_image_feature', action='store_true',
+                        default=getattr(defaults, 'USE_IMAGE_FEATURE', False))
+    images.add_argument('--no-image-feature', dest='use_image_feature', action='store_false')
+    parser.add_argument('--image-encoder', '--image_encoder', choices=['vit'],
+                        default=getattr(defaults, 'IMAGE_ENCODER', 'vit'))
+    parser.add_argument('--image-model-path', '--image_model_path',
+                        default=getattr(defaults, 'IMAGE_MODEL_PATH', 'google/vit-base-patch16-224-in21k'))
+    frozen = parser.add_mutually_exclusive_group()
+    frozen.add_argument('--freeze-image-encoder', '--freeze_image_encoder', action='store_true',
+                        default=getattr(defaults, 'FREEZE_IMAGE_ENCODER', True))
+    frozen.add_argument('--no-freeze-image-encoder', dest='freeze_image_encoder', action='store_false')
+    parser.add_argument('--image-feature-cache', '--image_feature_cache', type=Path,
+                        default=getattr(defaults, 'IMAGE_FEATURE_CACHE', None))
+    parser.add_argument('--image-root', type=Path, default=getattr(defaults, 'IMAGE_ROOT', None))
+    parser.add_argument('--image-field', default=getattr(defaults, 'IMAGE_FIELD', 'img_id'))
     parser.add_argument('--smoke', action='store_true', help='2+2 epochs; at most 5 queried anchors per refresh')
     parser.add_argument('--name-clusters', action='store_true', help='extra paid naming calls after final metrics')
     parser.add_argument('--no-name-clusters', action='store_true', help='skip the optional post-test naming calls')
@@ -171,6 +200,9 @@ def load_data(config, run_dir, tokenizer_path=None):
     data = MREData(run_dir / 'data', tokenizer, max_length=config['max_length'],
                    labeled_batch_size=config['labeled_batch_size'], train_batch_size=config['train_batch_size'],
                    eval_batch_size=config['eval_batch_size'], seed=config['seed'], caption_records=captions)
+    if config.get('use_image_feature', False):
+        from mre_image_features import load_image_features
+        data.final_image_features = load_image_features(config, run_dir, data.test_records)
     # Caption affects BERT only. GPT retains the baseline original tokenized text.
     truncation = {}
     for name, rows in (('train_labeled', data.labeled_records), ('train_unlabeled', data.unlabeled_records),
@@ -198,8 +230,9 @@ def evaluate_saved_run(run_dir):
     checkpoint = torch.load(run_dir / ('last_model.pt' if original else 'best_model.pt'), map_location='cpu')
     model.load_state_dict(checkpoint['model_state'])
     if original:
+        fusion = {'image_features': data.final_image_features} if config.get('use_image_feature') else {}
         metrics, predictions, _ = cluster_score_loader(model, data.test_loader, device,
-            data.n_base, data.n_total, config['seed'], config['kmeans_n_init'])
+            data.n_base, data.n_total, config['seed'], config['kmeans_n_init'], **fusion)
     else:
         metrics, predictions = score_loader(model, data.test_loader, checkpoint['centers'].numpy(), device,
                                             data.n_base, data.n_total)
@@ -268,8 +301,12 @@ def main(argv=None):
     print('LLM enabled: {}; temperature: {}; relation prompt: {}; prompt version: {}'.format(
         config['llm_enabled'], config['llm_temperature'], config['relation_prompt'], config['prompt_version']),
         flush=True)
-    from mre_captions import snapshot_inputs
-    snapshot_inputs(config, run_dir, manifest)
+    if config.get('use_image_feature'):
+        from mre_image_features import snapshot_image_features
+        snapshot_image_features(config, run_dir, manifest)
+    else:
+        from mre_captions import snapshot_inputs
+        snapshot_inputs(config, run_dir, manifest)
     client = None
     if not (args.no_llm or args.prepare_only or args.check_data):
         client = create_client(args, run_dir)

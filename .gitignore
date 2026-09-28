@@ -13,3 +13,4 @@ api_key.txt
 llm_cache.jsonl
 llm_calls.jsonl
 caption_cache/
+image_feature_cache/
