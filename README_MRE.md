@@ -98,7 +98,7 @@ KMeans 显式设置 `n_init=10`，对应原仓库指定的 scikit-learn 1.2 默�
 
 原版命名在联合训练池上另做 KMeans，通过有标签类别原型与中心的**欧氏距离**匈牙利匹配找出 novel 簇；每簇取距离中心最近的三条文本查询 GPT。正式运行默认开启；只影响可解释性，不改变已经保存的准确率。无 LLM 对照和 smoke 默认关闭命名。
 
-API 默认只发送 model 和 messages，不发送 JSON mode、reasoning、temperature 或 max_tokens，以恢复原 LOOP 的调用参数。按原代码进行大小写敏感的子串解析：同时出现两种 Choice 时优先 Choice 1。
+API 现在默认显式发送 `temperature=0.0`（邻居查询和簇命名均生效），不发送 JSON mode 或 reasoning，`max_tokens` 仍由现有配置决定。历史版本曾省略 temperature；`--llm-temperature provider` 可保留该历史请求方式。温度 0 不保证中转站或整个训练逐次完全一致。按原代码进行大小写敏感的子串解析：同时出现两种 Choice 时优先 Choice 1。新增可选 MRE 社交媒体提示词和独立消融命令见 [README_LLM_ABLATION.md](README_LLM_ABLATION.md)。
 
 **中转站后端快照未核实。** 当前 `0301` 请求不可用是该端点/key 的实测结果，不能据此推断所有服务商都不可用。正式实验请求普通 `gpt-3.5-turbo`；响应字段也不证明其底层历史快照。请求/返回模型和名称不一致仍记录到日志，不会自动切换模型。汇报应写“通过中转站请求 gpt-3.5-turbo，使用 FewRel 有向关系提示词，实际快照未核实”，不能称为原始 0301 快照与原提示词的严格复现。
 

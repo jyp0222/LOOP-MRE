@@ -73,9 +73,19 @@ class LLMClient:
         base_url="https://api.openai.com/v1",
         naming_model="gpt-3.5-turbo",
         task_type="relation",
+        temperature=0.0,
+        relation_prompt="current",
     ):
         self.task_type = task_type
-        self.prompt_version, self.neighbor_instructions, self.naming_instructions = prompt_settings(task_type)
+        self.relation_prompt = relation_prompt
+        self.prompt_version, self.neighbor_instructions, self.naming_instructions = prompt_settings(
+            task_type, relation_prompt)
+        if temperature is not None:
+            if (isinstance(temperature, bool) or not isinstance(temperature, (int, float))
+                    or not math.isfinite(temperature) or not 0 <= temperature <= 2):
+                raise ValueError("LLM temperature must be finite and between 0 and 2, or None")
+            temperature = float(temperature)
+        self.temperature = temperature
         if model not in SUPPORTED_MODELS or naming_model not in SUPPORTED_MODELS:
             raise ValueError("model must be a supported GPT-3.5 Turbo model: {}".format(
                 ", ".join(SUPPORTED_MODELS)))
@@ -253,6 +263,8 @@ class LLMClient:
             "request_key": key,
             "task": task,
             "prompt_version": self.prompt_version,
+            "relation_prompt": self.relation_prompt,
+            "temperature": self.temperature,
             "status": status,
             "requested_model": requested_model,
             "reasoning_effort": self.reasoning_effort,
@@ -276,8 +288,10 @@ class LLMClient:
             "model": self.naming_model if task == "name_cluster" else self.model,
             "messages": messages,
         }
-        # Upstream supplied only model/messages. An explicit override is recorded
-        # in the cache key; the default request retains upstream API defaults.
+        # None explicitly reproduces the old omitted-temperature request.
+        # The complete payload is hashed below, so temperatures never share cache entries.
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
         if self.max_output_tokens is not None:
             payload["max_tokens"] = self.max_output_tokens
         canonical = json.dumps({"version": self.prompt_version, "endpoint": self.endpoint,

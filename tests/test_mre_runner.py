@@ -1,5 +1,7 @@
 """Test the API-check entry point without loading BERT or making paid calls."""
 import json
+import sys
+from types import SimpleNamespace
 
 import pytest
 
@@ -21,6 +23,8 @@ def test_default_runner_constructs_gpt35_client_without_key_or_network(monkeypat
     assert client.max_output_tokens is None
     assert client.max_retries == 0
     assert client.requests_made == 0
+    assert client.temperature == 0.0
+    assert client.relation_prompt == 'current'
 
 
 @pytest.mark.parametrize('options', [
@@ -54,6 +58,7 @@ def test_check_llm_reports_actual_version_without_loading_training(monkeypatch, 
     assert 'Choice 1' in output
     assert 'UNVERIFIED' in output
     assert 'Prompt version: fewrel-directed-relation-choice-v4' in output
+    assert 'LLM temperature: 0.0' in output
 
 
 def test_check_llm_rejects_fallback_instead_of_claiming_connection_passed(monkeypatch):
@@ -76,6 +81,8 @@ def test_original_defaults_and_mre_exceptions_are_explicit():
     assert cfg['name_clusters'] is True
     assert cfg['max_queries_per_refresh'] is None
     assert cfg['model'] == cfg['naming_model'] == 'gpt-3.5-turbo'
+    assert cfg['llm_temperature'] == 0.0 and cfg['temperature'] == 0.07
+    assert cfg['relation_prompt'] == 'current'
     assert cfg['prompt_version'] == 'fewrel-directed-relation-choice-v4'
     assert cfg['experiment_variant'] == 'loop_mre_random40_gpt35_v3'
     assert 'known_cls_ratio' not in cfg and 'labeled_ratio' not in cfg
@@ -109,8 +116,103 @@ def test_prepare_only_records_new_protocol_and_prints_class_lists(tmp_path, monk
     manifest = json.loads((run_dir / 'data' / 'manifest.json').read_text(encoding='utf-8'))
     assert config['data_protocol'] == manifest['protocol'] == 'mre_transductive_random_half'
     assert config['seed'] == manifest['seed'] == 2
+    assert config['llm_temperature'] == 0.0 and config['relation_prompt'] == 'current'
     assert (manifest['n_base'], manifest['n_novel']) == (40, 40)
     output = capsys.readouterr().out
     assert 'MRE random-half classes: 40 base / 40 novel (seed=2)' in output
     assert 'Base: ' + str(manifest['base_classes']) in output
     assert 'Novel: ' + str(manifest['novel_classes']) in output
+
+
+@pytest.mark.parametrize('option,expected', [('0', 0.0), ('0.5', 0.5), ('2', 2.0), ('provider', None)])
+@pytest.mark.parametrize('prompt', ['current', 'mre-v2'])
+def test_runner_temperature_and_prompt_reach_config_and_client(option, expected, prompt):
+    args = run_mre.build_parser().parse_args(['--llm-temperature', option, '--relation-prompt', prompt])
+    config = run_mre.experiment_config(args)
+    client = run_mre.create_client(args)
+    assert config['llm_temperature'] == client.temperature == expected
+    assert config['relation_prompt'] == client.relation_prompt == prompt
+    assert config['prompt_version'] == client.prompt_version
+    assert config['temperature'] == 0.07  # RNCL still uses its independent temperature.
+    assert config['llm_enabled'] is True
+
+
+def test_runner_can_set_temperature_and_prompt_in_python_config(monkeypatch):
+    monkeypatch.setattr(run_mre.defaults, 'LLM_TEMPERATURE', None, raising=False)
+    monkeypatch.setattr(run_mre.defaults, 'RELATION_PROMPT', 'mre-v2', raising=False)
+    args = run_mre.build_parser().parse_args([])
+    config, client = run_mre.experiment_config(args), run_mre.create_client(args)
+    assert config['llm_temperature'] is client.temperature is None
+    assert config['relation_prompt'] == client.relation_prompt == 'mre-v2'
+    assert config['temperature'] == 0.07
+
+
+@pytest.mark.parametrize('option', ['-1', '2.01', 'nan', 'inf', 'True', 'bad'])
+def test_invalid_cli_temperature_is_rejected(option):
+    with pytest.raises(SystemExit) as error:
+        run_mre.build_parser().parse_args(['--llm-temperature', option])
+    assert error.value.code == 2
+
+
+def test_no_llm_switch_retains_baseline_training_settings():
+    parser = run_mre.build_parser()
+    baseline = run_mre.experiment_config(parser.parse_args(['--no-llm']))
+    changed = run_mre.experiment_config(parser.parse_args([
+        '--no-llm', '--llm-temperature', 'provider', '--relation-prompt', 'mre-v2']))
+    assert changed['llm_enabled'] is changed['name_clusters'] is False
+    changed.pop('llm_temperature')
+    changed.pop('relation_prompt')
+    changed.pop('prompt_version')
+    for key in ('llm_temperature', 'relation_prompt', 'prompt_version'):
+        baseline.pop(key)
+    assert baseline == changed
+
+
+@pytest.mark.parametrize('no_llm', [False, True])
+def test_runner_records_settings_and_skips_client_when_disabled(tmp_path, monkeypatch, no_llm):
+    """Exercise runner orchestration with stand-ins; never load BERT or train."""
+    def forbidden(*args, **kwargs):
+        raise AssertionError('No network or credentials allowed')
+    monkeypatch.setattr('llm_client.requests.post', forbidden)
+    monkeypatch.setattr('llm_client.getpass', forbidden)
+
+    def prepare(source, destination, seed, position_format, **kwargs):
+        destination.mkdir(parents=True)
+        manifest = {'n_base': 11, 'n_novel': 11, 'base_classes': [], 'novel_classes': [],
+                    'splits': {}, 'sources': {}, 'audit': {}, 'protocol': 'test_fixture'}
+        (destination / 'manifest.json').write_text(json.dumps(manifest))
+        return manifest
+    monkeypatch.setattr('mre_protocol.prepare_dataset', prepare)
+    monkeypatch.setattr('mre_captions.snapshot_inputs', lambda *args: None)
+    monkeypatch.setattr(run_mre, 'runtime_info', lambda: {})
+    monkeypatch.setattr(run_mre, 'load_data', lambda *args: (object(), object()))
+    received = []
+
+    class Trainer:
+        def __init__(self, config, data, tokenizer, run_dir, client):
+            received.append(client)
+        def train(self):
+            pass
+    monkeypatch.setitem(sys.modules, 'mre_trainer', SimpleNamespace(MRETrainer=Trainer))
+    if no_llm:
+        monkeypatch.setattr(run_mre, 'create_client', forbidden)
+    outputs = tmp_path / 'outputs'
+    arguments = ['--output-root', str(outputs), '--bert-model', str(tmp_path),
+                 '--relation-prompt', 'mre-v2', '--llm-temperature', '0']
+    if no_llm:
+        arguments.append('--no-llm')
+    run_mre.main(arguments)
+    run = next(outputs.iterdir())
+    config = json.loads((run / 'config.json').read_text())
+    assert config['llm_temperature'] == 0.0 and config['temperature'] == 0.07
+    assert config['relation_prompt'] == 'mre-v2'
+    assert config['llm_enabled'] is (not no_llm)
+    if no_llm:
+        assert received == [None]
+        assert not (run / 'llm_summary.json').exists()
+    else:
+        summary = json.loads((run / 'llm_summary.json').read_text())
+        assert summary['llm_temperature'] == 0.0
+        assert summary['relation_prompt'] == 'mre-v2'
+        assert summary['prompt_version'] == config['prompt_version'] == received[0].prompt_version
+        assert summary['http_attempts'] == 0 and summary['fallback_count'] == 0

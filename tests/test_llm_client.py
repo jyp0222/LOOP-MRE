@@ -1,4 +1,5 @@
 """Offline tests: FewRel prompts, LOOP Choice parser and auditable transport."""
+import hashlib
 import json
 from types import SimpleNamespace
 
@@ -40,14 +41,15 @@ def stub(monkeypatch, response=None, status=200):
     return calls
 
 
-def test_neighbor_request_compares_directed_relations_and_keeps_api_defaults(monkeypatch):
+def test_neighbor_request_compares_directed_relations_with_explicit_zero_temperature(monkeypatch):
     calls = stub(monkeypatch)
     client = LLMClient(api_key=KEY)
     assert client.choose_neighbor(QUERY, CHOICES) == 1
     url, request = calls[0]
     assert url == "https://api.openai.com/v1/chat/completions"
     payload = request['json']
-    assert set(payload) == {'model', 'messages'}
+    assert set(payload) == {'model', 'messages', 'temperature'}
+    assert payload['temperature'] == 0.0
     assert payload['model'] == 'gpt-3.5-turbo'
     assert len(payload['messages']) == 1 and payload['messages'][0]['role'] == 'user'
     prompt = payload['messages'][0]['content']
@@ -70,7 +72,8 @@ def test_naming_uses_same_model_and_names_head_to_tail_relation(monkeypatch):
     samples = ["one", "two", "three"]
     assert client.name_cluster(samples) == " place of birth "
     payload = calls[0][1]['json']
-    assert set(payload) == {'model', 'messages'}
+    assert set(payload) == {'model', 'messages', 'temperature'}
+    assert payload['temperature'] == 0.0
     assert payload['model'] == client.model == 'gpt-3.5-turbo'
     assert payload['messages'][0] == {'role': 'system', 'content': 'You are a helpful assistant.'}
     prompt = payload['messages'][1]['content']
@@ -246,3 +249,82 @@ def test_output_files_cannot_overwrite_key_file(tmp_path):
         LLMClient(api_key_file=path, cache_path=path)
     with pytest.raises(ValueError):
         LLMClient(cache_path=path, log_path=path)
+
+
+@pytest.mark.parametrize('temperature', [None, 0.0, 0.5, 2.0])
+def test_temperature_applies_to_both_tasks_and_is_logged(monkeypatch, tmp_path, temperature):
+    calls = stub(monkeypatch)
+    log = tmp_path / 'calls.jsonl'
+    client = LLMClient(api_key=KEY, temperature=temperature, log_path=log)
+    client.choose_neighbor(QUERY, CHOICES)
+    client.name_cluster(['one', 'two', 'three'])
+    assert len(calls) == 2
+    for _, request in calls:
+        if temperature is None:
+            assert 'temperature' not in request['json']
+        else:
+            assert request['json']['temperature'] == temperature
+    records = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [row['task'] for row in records] == ['choose_neighbor', 'name_cluster']
+    assert all(row['temperature'] == temperature and row['relation_prompt'] == 'current'
+               for row in records)
+
+
+@pytest.mark.parametrize('temperature', [None, 0.0, 0.5])
+def test_temperature_caches_are_isolated_and_reusable_without_network(monkeypatch, tmp_path, temperature):
+    cache = tmp_path / 'cache.jsonl'
+    calls = stub(monkeypatch)
+    LLMClient(api_key=KEY, cache_path=cache, temperature=temperature).choose_neighbor(QUERY, CHOICES)
+    assert len(calls) == 1
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError('Cache lookup must not use the network or credentials')
+    monkeypatch.setattr(llm_client.requests, 'post', forbidden)
+    monkeypatch.setattr(llm_client, 'getpass', forbidden)
+    same = LLMClient(cache_path=cache, temperature=temperature, max_requests=0)
+    assert same.choose_neighbor(QUERY, CHOICES) == 1
+    assert same.cache_hits == 1 and same.requests_made == 0
+    for other in (None, 0.0, 0.5):
+        if other == temperature:
+            continue
+        changed = LLMClient(cache_path=cache, temperature=other, max_requests=0)
+        with pytest.raises(LLMBudgetExceeded):
+            changed.choose_neighbor(QUERY, CHOICES)
+        assert changed.cache_hits == 0
+
+
+def test_current_prompt_is_unchanged_and_mre_v2_cache_cannot_replace_it(monkeypatch, tmp_path):
+    current = LLMClient(api_key=KEY)
+    baseline_text = '\n'.join((current.prompt_version, current.neighbor_instructions,
+                                current.naming_instructions))
+    # Frozen before this ablation: guarantees --relation-prompt current preserves
+    # all legacy instruction text, not merely a version label.
+    assert hashlib.sha256(baseline_text.encode()).hexdigest() == (
+        '1262610bdc8e0ffefe396f789eb9aa13cf33803155b65720b07aa46a2fba244e')
+    cache = tmp_path / 'cache.jsonl'
+    calls = stub(monkeypatch)
+    for prompt in ('current', 'mre-v2'):
+        LLMClient(api_key=KEY, cache_path=cache, relation_prompt=prompt).choose_neighbor(QUERY, CHOICES)
+    assert len(calls) == 2
+    assert calls[0][1]['json']['messages'] != calls[1][1]['json']['messages']
+    for prompt in ('current', 'mre-v2'):
+        replay = LLMClient(cache_path=cache, relation_prompt=prompt, max_requests=0)
+        assert replay.choose_neighbor(QUERY, CHOICES) == 1
+        assert replay.cache_hits == 1 and replay.requests_made == 0
+
+
+def test_entity_typing_keeps_met_prompt_and_rejects_relation_prompt(monkeypatch):
+    from mre_prompts import MET_PROMPT_VERSION, MET_NEIGHBOR_INSTRUCTIONS
+    calls = stub(monkeypatch)
+    client = LLMClient(api_key=KEY, task_type='entity_type')
+    client.choose_neighbor(QUERY, CHOICES)
+    assert client.prompt_version == MET_PROMPT_VERSION
+    assert calls[0][1]['json']['messages'][0]['content'].startswith(MET_NEIGHBOR_INSTRUCTIONS)
+    with pytest.raises(ValueError, match='task_type=relation'):
+        LLMClient(task_type='entity_type', relation_prompt='mre-v2')
+
+
+@pytest.mark.parametrize('temperature', [-0.1, 2.1, True, False, '0', float('nan'), float('inf'), -float('inf')])
+def test_invalid_temperature_cannot_become_neighbor_fallback(temperature):
+    with pytest.raises(ValueError, match='temperature'):
+        LLMClient(temperature=temperature)

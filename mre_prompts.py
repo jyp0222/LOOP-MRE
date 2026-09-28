@@ -27,10 +27,20 @@ MET_NAMING_INSTRUCTIONS = (
 )
 
 
-def prompt_settings(task_type):
+def prompt_settings(task_type, relation_prompt='current'):
+    if relation_prompt not in ('current', 'mre-v2'):
+        raise ValueError('Unknown relation_prompt: {}'.format(relation_prompt))
     if task_type == 'relation':
+        if relation_prompt == 'mre-v2':
+            from mre_social_prompts import (
+                PROMPT_VERSION as version, NEIGHBOR_INSTRUCTIONS as neighbor,
+                NAMING_INSTRUCTIONS as naming,
+            )
+            return version, neighbor, naming
         return PROMPT_VERSION, NEIGHBOR_INSTRUCTIONS, NAMING_INSTRUCTIONS
     if task_type == 'entity_type':
+        if relation_prompt != 'current':
+            raise ValueError('MRE relation prompts require task_type=relation')
         return MET_PROMPT_VERSION, MET_NEIGHBOR_INSTRUCTIONS, MET_NAMING_INSTRUCTIONS
     raise ValueError('Unknown task_type: {}'.format(task_type))
 
